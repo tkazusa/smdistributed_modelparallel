@@ -1,0 +1,1 @@
+smdistributed.modelparallel is governed by the AWS Customer Agreement.
