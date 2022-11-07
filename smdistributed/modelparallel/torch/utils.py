@@ -11,9 +11,33 @@ import torch
 # First Party
 from smdistributed.modelparallel.backend.logger import get_logger
 from smdistributed.modelparallel.torch.core import core, tp_rank, tp_size
+from smdistributed.modelparallel.torch.exceptions import (
+    SMPCheckpointError,
+    SMPRuntimeError,
+    SMPUnsupportedError,
+)
 from smdistributed.modelparallel.torch.nn.utils import get_local_channels, get_start_pos_for_slicing
 
 logger = get_logger()
+
+
+def unflatten_from_args(all_args, keyword_order):
+    pos_count = len(all_args) - len(keyword_order)
+
+    args = all_args[:pos_count]
+    kwargs = {keyword: arg for keyword, arg in zip(keyword_order, all_args[pos_count:])}
+    return args, kwargs
+
+
+def flatten_into_args(args, kwargs):
+    all_args = []
+    keyword_order = []
+    all_args.extend(args)
+    for k, v in kwargs.items():
+        keyword_order.append(k)
+        all_args.append(v)
+
+    return all_args, keyword_order
 
 
 @contextmanager
@@ -69,7 +93,8 @@ def _unflatten_structure_internal(flat_structure, phantom_structure):
         for k in phantom_structure:
             structure[k] = _unflatten_structure_internal(flat_structure, phantom_structure[k])
     else:
-        assert isinstance(phantom_structure, int), "Invalid phantom structure"
+        if not isinstance(phantom_structure, int):
+            raise SMPRuntimeError("Invalid phantom structure")
         structure = flat_structure[phantom_structure]
     return structure
 
@@ -119,7 +144,7 @@ def _flatten_structure_internal(structure, counter):
 def map_structure(fn, structure):
     """ Apply the callable `fn` to every element of the possibly nested structure `structure`,
     and return the result."""
-    if isinstance(structure, (list, tuple, set)):
+    if isinstance(structure, (list, tuple, set)) and not isinstance(structure, torch.Size):
         mapped_structure = []
         for item in structure:
             mapped_structure.append(map_structure(fn, item))
@@ -141,7 +166,7 @@ def map_structure(fn, structure):
     return fn(structure)
 
 
-def debug_print_input(name, index, k, inp):
+def debug_print_input(name, index, k, inp):  # pragma: no cover
     if torch.is_tensor(inp):
         inp_print = f"{inp.shape}"
     elif isinstance(inp, torch.nn.Module):
@@ -153,7 +178,7 @@ def debug_print_input(name, index, k, inp):
     )
 
 
-def debug_print_outputs(name, outputs):
+def debug_print_outputs(name, outputs):  # pragma: no cover
     s = f"{core.rank()} name: {name}, outputs:"
     if torch.is_tensor(outputs):
         list_of_outputs = [outputs]
@@ -285,7 +310,7 @@ def check_supported(module_name, args, kwargs, skip_tensor_check=False):
             and not (x.dtype.is_floating_point or x.dtype.is_complex)
             and x.requires_grad
         ):
-            raise TypeError(
+            raise SMPUnsupportedError(
                 f"Module: {module_name} has an argument with requires_grad=True "
                 "with a non-float type. "
                 "Please change the type of the tensor to a float type "
@@ -300,7 +325,7 @@ def check_supported(module_name, args, kwargs, skip_tensor_check=False):
             try:
                 state.model.get_param_name(x)
             except KeyError:
-                raise RuntimeError(
+                raise SMPUnsupportedError(
                     f"Unsupported use case for module: '{module_name}'. Parameter passing in forward is not supported for parameters not owned by the DistributedModel."
                 )
 
@@ -367,7 +392,42 @@ def get_root_module_for_param(model, state_param_name):
     return model
 
 
-def slice_tp_tensors_in_state_dict(state_dict):
+def slice_tp_tensor(param, tensor_to_slice=None):
+    """
+    Slice a full tensor to its tensor parallel parts
+    Args:
+        param: The model parameter that to decide the slicing logic
+        tensor_to_slice: The tensor to be sliced, if set to None the parameter will be sliced.
+    """
+    from smdistributed.modelparallel.torch.state_mod import state
+
+    if tensor_to_slice == None:
+        tensor_to_slice = param
+    axis = get_distribution_axis(param)
+    if axis is None:
+        return tensor_to_slice
+    else:
+        # tensor must be a torch.Tensor (specifically, nn.Parameter)
+        if not isinstance(tensor_to_slice, torch.Tensor):
+            raise SMPRuntimeError(f"Non-tensor distributed object found {type(tensor_to_slice)}")
+
+        # slice the tensor
+        weight_split_shapes = state.module_manager.weight_split_shapes.get(param, None)
+        slice_size = (
+            get_local_channels(tensor_to_slice.size(axis))
+            if weight_split_shapes == None
+            else weight_split_shapes[tp_rank()]
+        )
+        start = (
+            get_start_pos_for_slicing(tensor_to_slice.size(axis))
+            if weight_split_shapes == None
+            else sum(weight_split_shapes[: tp_rank()])
+        )
+        sliced_tensor = tensor_to_slice.narrow(axis, start, slice_size).contiguous()
+        return sliced_tensor
+
+
+def slice_tp_tensors_in_state_dict(state_dict, strict=True):
     """Slices tp tensors in state dict
     """
     from smdistributed.modelparallel.torch.state_mod import state
@@ -380,43 +440,41 @@ def slice_tp_tensors_in_state_dict(state_dict):
     if len(state_dict) == 0:
         return state_dict
 
-    # find root module for a state param name.
-    state_param_name = list(state_dict.keys())[0]
-    model = get_root_module_for_param(state.model, state_param_name)
-
-    model_state_dict = model.state_dict()
-    model_params = dict(named_parameters_nonunique(model))
-    model_buffers = dict(named_buffers_nonunique(model))
+    full_state_dict = state.model.get_module().state_dict(keep_vars=True)
 
     sliced_state_dict = {}
     for name, item in state_dict.items():
-        param = model_params.get(name) if name in model_params else model_buffers.get(name, None)
+        param = full_state_dict.get(name, None)
         axis = get_distribution_axis(param)
         if axis is None:
+            # one rank tensor, only tp rank 0 should execute this block
             if _on_only_one_rank(param):
                 if tp_rank() == 0:
                     sliced_state_dict[name] = item
-            elif name in model_state_dict:
+                else:
+                    raise SMPCheckpointError(
+                        f"one rank param {name} is detected on non-zero tp rank {tp_rank()}"
+                    )
+            # unexpected key or one rank tensor for tp_rank > 1
+            elif name not in full_state_dict:
+                if tp_rank() == 0:
+                    msg = rmsg(
+                        f"Loaded checkpoint contains parameter {name} that does not exist in the current model!"
+                    )
+                    if strict:
+                        raise SMPCheckpointError(msg)
+                    else:
+                        logger.warn(msg)
+            # non-tp tensor
+            else:
                 sliced_state_dict[name] = item
-        else:
-            # item must be a torch.Tensor (specifically, nn.Parameter)
-            assert isinstance(
-                item, torch.Tensor
-            ), f"Non-tensor distributed object found {type(item)}"
-
-            # slice the tensor
-            weight_split_shapes = state.module_manager.weight_split_shapes.get(param, None)
-            slice_size = (
-                get_local_channels(item.size(axis))
-                if weight_split_shapes == None
-                else weight_split_shapes[tp_rank()]
-            )
-            start = (
-                get_start_pos_for_slicing(item.size(axis))
-                if weight_split_shapes == None
-                else sum(weight_split_shapes[: tp_rank()])
-            )
-            sliced_state_dict[name] = item.narrow(axis, start, slice_size).contiguous()
+        else:  # tp tensors
+            # Only slice the local parameters as remote ones are garbage collected
+            if not state.model.is_local_parameter(param):
+                sliced_tensor = item
+            else:
+                sliced_tensor = slice_tp_tensor(param, tensor_to_slice=item)
+            sliced_state_dict[name] = sliced_tensor
     return sliced_state_dict
 
 
@@ -491,7 +549,9 @@ def collect_and_merge_in_group(
         group = CommGroup.PP_GROUP
 
     if group not in {CommGroup.TP_GROUP, CommGroup.PP_GROUP}:
-        raise ValueError("Only TP_GROUP and PP_GROUP are supported for allgather and merge.")
+        raise SMPCheckpointError(
+            "Only TP_GROUP and PP_GROUP are supported for allgather and merge."
+        )
 
     def _duplicated_params(dict1, dict2):
         same_key = set(dict1.keys()).intersection(set(dict2.keys()))
@@ -513,7 +573,7 @@ def collect_and_merge_in_group(
             duplicated_params = _duplicated_params(item, full_input_dict)
             if len(duplicated_params) > 0:
                 if strict:
-                    raise ValueError(
+                    raise SMPCheckpointError(
                         f"{core.rank()} Duplicate parameters {duplicated_params} found across ranks while combining state_dicts."
                     )
                 else:
@@ -533,17 +593,11 @@ def collect_and_merge_in_group(
                 return full_input_dict
             max_params_index = 0
             max_params_obj = all_input_dict[max_params_index]
-            example_param_name = list(max_params_obj.keys())[0] if len(max_params_obj) > 0 else None
-            model = get_root_module_for_param(state.model, example_param_name)
-            model_params = dict(named_parameters_nonunique(model))
-            model_buffers = dict(named_buffers_nonunique(model))
+            full_state_dict = state.model.get_module().state_dict(keep_vars=True)
 
             for param_name, param in max_params_obj.items():
-                param_or_buffer = (
-                    model_params.get(param_name)
-                    if param_name in model_params
-                    else model_buffers.get(param_name, None)
-                )
+                # param_name should always be in full_state_dict with gather_to_rank0, keep None for back compatibility
+                param_or_buffer = full_state_dict.get(param_name, None)
                 axis = get_distribution_axis(param_or_buffer)
 
                 if axis is None:
@@ -579,7 +633,9 @@ def collect_and_merge_in_group(
 
                 result_param_states = {}
                 for param_state in param_states:
-                    if isinstance(param_states[param_state], torch.Tensor):
+                    if isinstance(param_states[param_state], torch.Tensor) and param_states[
+                        param_state
+                    ].shape != torch.Size([]):
                         if axis is not None:
                             # param state is distributed, concatenate along the axis
                             outputs = []
@@ -603,7 +659,7 @@ def collect_and_merge_in_group(
 
 
 def raise_ddp_overlapping_exception(method_name):
-    raise NotImplementedError(
+    raise SMPUnsupportedError(
         f"{method_name} is only supported when SMP is configured to use DDP and overlapping_allreduce is set to True. "
         "Please set ddp=True in SMP config, and ensure overlapping_allreduce parameter in smp.DistributedModel wrapper is set to True."
     )

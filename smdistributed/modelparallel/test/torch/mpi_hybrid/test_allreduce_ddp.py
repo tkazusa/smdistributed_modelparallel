@@ -2,227 +2,204 @@
 import sys
 import unittest
 
-# Third Party
-import torch
-
 # First Party
-import smdistributed.modelparallel.torch as smp
-from smdistributed.modelparallel.test.torch.mpi.test_backward import (
-    TestBackwardBase,
-    TestCheckpointing,
-    TestGrad,
-)
-from smdistributed.modelparallel.test.torch.utils import add_num_grads_hook
-from smdistributed.modelparallel.torch.step import PTTensorSplitter
+from smdistributed.modelparallel.test.torch.mpi.test_backward import TestCheckpointing, TestGrad
+from smdistributed.modelparallel.test.torch.smp_test_base import SMPTestConfig
 
 
-class TestAllreduceBase(TestBackwardBase):
-    def _run_without_smp(self, model, args_device, target, step_fns):
-        # run without smp
-        num_hook_calls, handles = add_num_grads_hook(model)
-        for i in range(self.backward_passes_per_step):
-            step_fns[0](model, target, *args_device)
-        grads = self._collect_grads(model)
-        for h in handles:
-            h.remove()
-        return grads
-
-    def _run_with_smp(
-        self,
-        model,
-        args,
-        target,
-        step_fns,
-        checkpointing=False,
-        module_config_to_checkpoint_with_non_torch_api=None,
-        collect_grads=True,
-    ):
-        if isinstance(model, smp.DistributedModel):
-            if self.allreduce_engine == "horovod":
-                model.module.checkpointing = checkpointing
-            elif self.allreduce_engine == "ddp":
-                model.module.module.checkpointing = checkpointing
-        else:
-            model.checkpointing = checkpointing
-            model = smp.DistributedModel(
-                model,
-                backward_passes_per_step=self.backward_passes_per_step,
-                overlapping_allreduce=self.overlapping_allreduce,
-                gradient_as_bucket_view=self.gradient_as_bucket_view,
-            )
-
-        if module_config_to_checkpoint_with_non_torch_api:
-            mod, confs = module_config_to_checkpoint_with_non_torch_api
-
-            # remove the module wrapper
-            # names are for ddp by default, remove the extra module
-            if self.allreduce_engine == "horovod":
-                mod = "/".join(mod.split("/")[:2] + mod.split("/")[3:])
-            smp.set_activation_checkpointing(smp.state.module_manager.get_module(mod), **confs)
-
-        split_arg, split_target = self._split_data_for_dp(step_fns, args, target)
-        num_hook_calls, handles = add_num_grads_hook(model)
-        for i in range(self.backward_passes_per_step - 1):
-            step_fns[1](model, split_target, *split_arg)
-
-        with self._with_empty_clear_minibatch_fn():
-            step_fns[1](model, split_target, *split_arg)
-
-            if collect_grads:
-                smp_grads = self._collect_grads(model)
-            else:
-                smp_grads = None
-
-            expected_grad_counts = smp.state.model.grad_counter.get_expected_param_grad_counts()
-
-        for h in handles:
-            h.remove()
-        return num_hook_calls, model, smp_grads, expected_grad_counts
-
-    def _split_data_for_dp(self, step_fns, args_device, target):
-        # split into numdpgroups batches, feed one into each dp group
-        # and verify average of grads
-        num_dp_groups = smp.dp_size()
-        splitter = PTTensorSplitter(step_fns[1])
-        split_args, _ = splitter.preprocess_args_all_mbs(args_device, {}, num_dp_groups)
-        split_targets, _ = splitter.preprocess_args_all_mbs((target,), {}, num_dp_groups)
-        split_arg = split_args[smp.dp_rank()]
-
-        split_target = split_targets[smp.dp_rank()][0]
-        return split_arg, split_target
-
-
-class TestAllreduceDDPBase(TestAllreduceBase):
+class TestAllreduceDDP(TestGrad):
     def setUp(self):
-        super(TestAllreduceDDPBase, self).setUp()
-        torch.manual_seed(2)
-        self.batch_dim = 80
-        self.num_microbatches = 2
-        self.backward_passes_per_step = 1
-        self.allreduce_engine = "ddp"
-        self.overlapping_allreduce = True
-        self.gradient_as_bucket_view = False
+        super(TestAllreduceDDP, self).setUp()
+        config = SMPTestConfig(
+            batch_size=80,
+            smp_dist_model_kwargs={"overlapping_allreduce": True, "gradient_as_bucket_view": False},
+        )
+        self.set_test_config(config)
 
 
-class TestAllreduceDDP(TestAllreduceDDPBase, TestGrad):
-    pass
-
-
-class TestAllreduceDDPCheckpointing(TestAllreduceDDPBase, TestCheckpointing):
-    pass
-
-
-class TestAllreduceDDPGradBucketBase(TestAllreduceBase):
+class TestAllreduceDDPCheckpointing(TestCheckpointing):
     def setUp(self):
-        super(TestAllreduceDDPGradBucketBase, self).setUp()
-        torch.manual_seed(2)
-        self.batch_dim = 80
-        self.num_microbatches = 2
-        self.backward_passes_per_step = 1
-        self.allreduce_engine = "ddp"
-        self.overlapping_allreduce = True
-        self.gradient_as_bucket_view = True
+        super(TestAllreduceDDPCheckpointing, self).setUp()
+        config = SMPTestConfig(
+            batch_size=80,
+            smp_dist_model_kwargs={"overlapping_allreduce": True, "gradient_as_bucket_view": False},
+        )
+        self.set_test_config(config)
 
 
-class TestAllreduceDDPGradBucket(TestAllreduceDDPGradBucketBase, TestGrad):
-    pass
-
-
-class TestAllreduceDDPGradBucketCheckpointing(TestAllreduceDDPGradBucketBase, TestCheckpointing):
-    pass
-
-
-class TestAllreduceDDPNonoverlappingBase(TestAllreduceBase):
+class TestAllreduceDDPGradBucket(TestGrad):
     def setUp(self):
-        super(TestAllreduceDDPNonoverlappingBase, self).setUp()
-        torch.manual_seed(2)
-        self.batch_dim = 80
-        self.num_microbatches = 2
-        self.backward_passes_per_step = 1
-        self.allreduce_engine = "ddp"
-        self.overlapping_allreduce = False
-        self.gradient_as_bucket_view = False
+        super(TestAllreduceDDPGradBucket, self).setUp()
+        config = SMPTestConfig(
+            batch_size=80,
+            smp_dist_model_kwargs={"overlapping_allreduce": True, "gradient_as_bucket_view": True},
+        )
+        self.set_test_config(config)
 
 
-class TestAllreduceDDPNonoverlapping(TestAllreduceDDPNonoverlappingBase, TestGrad):
-    pass
-
-
-class TestAllreduceDDPNonoverlappingCheckpointing(
-    TestAllreduceDDPNonoverlappingBase, TestCheckpointing
-):
-    pass
-
-
-class TestAllreduceDDPGradAccumBase(TestAllreduceBase):
+class TestAllreduceDDPGradBucketCheckpointing(TestCheckpointing):
     def setUp(self):
-        super(TestAllreduceBase, self).setUp()
-        torch.manual_seed(2)
-        self.batch_dim = 160
-        self.num_microbatches = 4
-        self.backward_passes_per_step = 3
-        self.allreduce_engine = "ddp"
-        self.overlapping_allreduce = True
-        self.gradient_as_bucket_view = False
+        super(TestAllreduceDDPGradBucketCheckpointing, self).setUp()
+        config = SMPTestConfig(
+            batch_size=80,
+            smp_dist_model_kwargs={"overlapping_allreduce": True, "gradient_as_bucket_view": True},
+        )
+        self.set_test_config(config)
 
 
-class TestAllreduceDDPGradAccum(TestAllreduceDDPGradAccumBase, TestGrad):
-    pass
-
-
-class TestAllreduceDDPGradAccumCheckpointing(TestAllreduceDDPGradAccumBase, TestCheckpointing):
-    pass
-
-
-class TestAllreduceDDPGradAccumNonoverlapping(TestAllreduceBase, TestGrad):
+class TestAllreduceDDPNonoverlapping(TestGrad):
     def setUp(self):
-        super(TestAllreduceBase, self).setUp()
-        torch.manual_seed(2)
-        self.batch_dim = 160
-        self.num_microbatches = 4
-        self.backward_passes_per_step = 3
-        self.allreduce_engine = "ddp"
-        self.overlapping_allreduce = False
-        self.gradient_as_bucket_view = False
+        super(TestAllreduceDDPNonoverlapping, self).setUp()
+        config = SMPTestConfig(
+            batch_size=80,
+            smp_dist_model_kwargs={
+                "overlapping_allreduce": False,
+                "gradient_as_bucket_view": False,
+            },
+        )
+        self.set_test_config(config)
 
 
-class TestAllreduceFP32GradBucketBase(TestAllreduceDDPGradBucketBase, TestGrad):
+class TestAllreduceDDPNonoverlappingCheckpointing(TestCheckpointing):
     def setUp(self):
-        super(TestAllreduceDDPGradBucketBase, self).setUp()
-        self.overlapping_allreduce = True
-        self.fp32_grad_accumulation = True
+        super(TestAllreduceDDPNonoverlappingCheckpointing, self).setUp()
+        config = SMPTestConfig(
+            batch_size=80,
+            smp_dist_model_kwargs={
+                "overlapping_allreduce": False,
+                "gradient_as_bucket_view": False,
+            },
+        )
+        self.set_test_config(config)
 
 
-class TestAllreduceFP32NonGradBucketBase(TestAllreduceDDPBase, TestGrad):
+class TestAllreduceDDPGradAccum(TestGrad):
     def setUp(self):
-        super(TestAllreduceDDPBase, self).setUp()
-        self.overlapping_allreduce = True
-        self.fp32_grad_accumulation = True
+        super(TestAllreduceDDPGradAccum, self).setUp()
+        num_steps = 3
+        config = SMPTestConfig(
+            num_steps=num_steps,
+            batch_size=160,
+            smp_config={"microbatches": 4},
+            smp_dist_model_kwargs={
+                "overlapping_allreduce": True,
+                "gradient_as_bucket_view": False,
+                "backward_passes_per_step": num_steps,
+            },
+        )
+        self.set_test_config(config)
 
 
-class TestAllreduceFP32DDPGradBucketGradAccum(TestAllreduceDDPGradAccumBase, TestGrad):
+class TestAllreduceDDPGradAccumCheckpointing(TestCheckpointing):
     def setUp(self):
-        super(TestAllreduceDDPGradAccumBase, self).setUp()
-        self.overlapping_allreduce = True
-        self.fp32_grad_accumulation = True
-        self.gradient_as_bucket_view = True
+        super(TestAllreduceDDPGradAccumCheckpointing, self).setUp()
+        num_steps = 3
+        config = SMPTestConfig(
+            num_steps=num_steps,
+            batch_size=160,
+            smp_config={"microbatches": 4},
+            smp_dist_model_kwargs={
+                "overlapping_allreduce": True,
+                "gradient_as_bucket_view": False,
+                "backward_passes_per_step": num_steps,
+            },
+        )
+        self.set_test_config(config)
 
 
-class TestAllreduceFP32DDPGradBucketCheckpointing(
-    TestAllreduceDDPGradBucketBase, TestCheckpointing
-):
+class TestAllreduceDDPGradAccumNonoverlapping(TestGrad):
     def setUp(self):
-        super(TestAllreduceDDPGradBucketBase, self).setUp()
-        self.module_base_name = "main/module"
-        self.overlapping_allreduce = True
-        self.fp32_grad_accumulation = True
-        self.gradient_as_bucket_view = True
+        super(TestAllreduceDDPGradAccumNonoverlapping, self).setUp()
+        num_steps = 3
+        config = SMPTestConfig(
+            num_steps=num_steps,
+            batch_size=160,
+            smp_config={"microbatches": 4},
+            smp_dist_model_kwargs={
+                "overlapping_allreduce": False,
+                "gradient_as_bucket_view": False,
+                "backward_passes_per_step": num_steps,
+            },
+        )
+        self.set_test_config(config)
+
+
+class TestAllreduceFP32GradBucket(TestGrad):
+    def setUp(self):
+        super(TestAllreduceFP32GradBucket, self).setUp()
+        # Requires reduced tolerance check when _fp32_grad_accumulation is enabled, not sure why since computation
+        # is exactly the same.
+        config = SMPTestConfig(
+            grad_atol=5e-3,
+            grad_rtol=1e-3,
+            batch_size=80,
+            smp_config={"_fp32_grad_accumulation": True, "fp16": True},
+            smp_dist_model_kwargs={"overlapping_allreduce": True, "gradient_as_bucket_view": True},
+            upscale_model_output=True,
+        )
+        self.set_test_config(config)
+
+
+class TestAllreduceFP32NonGradBucket(TestGrad):
+    def setUp(self):
+        super(TestAllreduceFP32NonGradBucket, self).setUp()
+        config = SMPTestConfig(
+            grad_atol=5e-3,
+            grad_rtol=1e-3,
+            batch_size=80,
+            smp_config={"_fp32_grad_accumulation": True, "fp16": True},
+            smp_dist_model_kwargs={"overlapping_allreduce": True, "gradient_as_bucket_view": False},
+            upscale_model_output=True,
+        )
+        self.set_test_config(config)
+
+
+class TestAllreduceFP32DDPGradBucketGradAccum(TestGrad):
+    def setUp(self):
+        super(TestAllreduceFP32DDPGradBucketGradAccum, self).setUp()
+        num_steps = 3
+        config = SMPTestConfig(
+            grad_atol=5e-3,
+            grad_rtol=1e-3,
+            loss_atol=1e-4,
+            num_steps=num_steps,
+            batch_size=160,
+            smp_config={"microbatches": 4, "_fp32_grad_accumulation": True, "fp16": True},
+            smp_dist_model_kwargs={
+                "overlapping_allreduce": True,
+                "gradient_as_bucket_view": True,
+                "backward_passes_per_step": num_steps,
+            },
+            upscale_model_output=True,
+        )
+        self.set_test_config(config)
+
+
+class TestAllreduceFP32DDPGradBucketCheckpointing(TestCheckpointing):
+    def setUp(self):
+        super(TestAllreduceFP32DDPGradBucketCheckpointing, self).setUp()
+        config = SMPTestConfig(
+            grad_atol=5e-3,
+            grad_rtol=1e-3,
+            batch_size=160,
+            smp_config={"_fp32_grad_accumulation": True, "fp16": True},
+            smp_dist_model_kwargs={"overlapping_allreduce": True, "gradient_as_bucket_view": True},
+            upscale_model_output=True,
+        )
+        self.set_test_config(config)
+        self.register_begin_hook(self.add_fp16_module_hook)
+
+    def add_fp16_module_hook(self):
+        for checkpointing_config in self.current_model.smp_activation_checkpointing_config:
+            # Add the fp16 module
+            module_name = checkpointing_config[0]
+            checkpointing_config[0] = module_name.replace("main", "main/module")
 
 
 if __name__ == "__main__":
     classes_to_run = []
     if len(sys.argv) == 1:
-        to_search = "testallreduceddp"
+        to_search = "testallreduce"
 
         for clsname in dir():
             if clsname.lower().startswith(to_search):

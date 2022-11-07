@@ -1,6 +1,7 @@
 # First Party
 from smdistributed.modelparallel.backend.collectives import CommGroup, RankType  # noqa: skip
 from smdistributed.modelparallel.torch.core import core
+from smdistributed.modelparallel.torch.exceptions import DDPNotEnabledError, InvalidCommGroupError
 from smdistributed.modelparallel.torch.state_mod import state
 
 MP_GROUP = CommGroup.MP_GROUP
@@ -31,6 +32,7 @@ def recv_from(src_rank, rank_type):
 
 def allgather(obj, group):
     return state.comm.allgather_large(obj, group)
+
 
 def gather(obj, group, rank=0):
     return state.comm.gather_large(obj, group, rank=rank)
@@ -71,45 +73,35 @@ def barrier(group=CommGroup.WORLD):
         rdp_barrier()
 
     else:
-        raise ValueError(
-            "Invalid group passed, it needs to be one of CommGroup.WORLD, CommGroup.PP_GROUP, CommGroup.DP_GROUP"
-        )
+        raise InvalidCommGroupError(group)
 
 
 def get_dp_process_group():
     if state.cfg.ddp:
         return state.dp_process_group
     else:
-        raise RuntimeError(
-            "Torch.dist is not initialized. Please enable DDP in config to use torch.dist"
-        )
+        raise DDPNotEnabledError
 
 
 def get_pp_process_group():
     if state.cfg.ddp:
         return state.pp_process_group
     else:
-        raise RuntimeError(
-            "Torch.dist is not initialized. Please enable DDP in config to use torch.dist"
-        )
+        raise DDPNotEnabledError
 
 
 def get_tp_process_group():
     if state.cfg.ddp:
         return state.tp_process_group
     else:
-        raise RuntimeError(
-            "Torch.dist is not initialized. Please enable DDP in config to use torch.dist"
-        )
+        raise DDPNotEnabledError
 
 
 def get_rdp_process_group():
     if state.cfg.ddp:
         return state.rdp_process_group
     else:
-        raise RuntimeError(
-            "Torch.dist is not initialized. Please enable DDP in config to use torch.dist"
-        )
+        raise DDPNotEnabledError
 
 
 def get_mp_process_group():
@@ -120,6 +112,4 @@ def get_world_process_group():
     if state.cfg.ddp:
         return state.world_process_group
     else:
-        raise RuntimeError(
-            "Torch.dist is not initialized. Please enable DDP in config to use torch.dist"
-        )
+        raise DDPNotEnabledError

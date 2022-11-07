@@ -14,7 +14,7 @@ from smdistributed.modelparallel.torch.messages import (
     ModuleExecutionRequest,
 )
 from smdistributed.modelparallel.torch.pipeline import MbStatus
-from smdistributed.modelparallel.torch.server import NoSuchRequest
+from smdistributed.modelparallel.torch.server import InvalidRequestError
 from smdistributed.modelparallel.torch.worker import WorkerHolder
 
 
@@ -79,7 +79,7 @@ class TestServer(unittest.TestCase):
         # starts to execute the module, then hits a new request that it's waiting on, then resumes
         try:
             smp.state.exec_server.process_request(mer)
-        except NoSuchRequest as exc:
+        except InvalidRequestError as exc:
             # as server thinks this is from a worker waiting for something it tries to resume worker
             assert exc.req == mer
         assert smp.state.exec_server.get_worker(next_worker_id).req == mer

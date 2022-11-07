@@ -1,11 +1,17 @@
 # Third Party
 import torch
 
+# First Party
+from smdistributed.modelparallel.torch.exceptions import HFGPTJConfigError
+
 try:
     from transformers.models.gptj.modeling_gptj import CausalLMOutputWithPast
+
     hf_transformers_available = True
 except ImportError:
     hf_transformers_available = False
+
+max_seq_len_gptj = None
 
 if hf_transformers_available:
 
@@ -27,19 +33,30 @@ if hf_transformers_available:
 
     def hf_gptj_transformer_init_hook(config):
         if config.n_embd % config.n_head != 0:
-            raise ValueError(
+            raise HFGPTJConfigError(
                 f"Embedding size ({config.n_embd}) must be divisible by the number of attention heads ({config.n_head}) for HuggingFace GPT-J model."
             )
 
         if config.activation_function not in ["gelu_new", "relu"]:
-            raise ValueError("Only 'gelu_new' and 'relu' activations are supported.")
+            raise HFGPTJConfigError("Only 'gelu_new' and 'relu' activations are supported.")
 
+        global max_seq_len_gptj
+        max_seq_len_gptj = config.n_positions
         kwargs = {
             "num_layers": config.n_layer,
             "num_attention_heads": config.n_head,
             "attention_head_size": config.n_embd // config.n_head,
             "hidden_size": config.n_embd,
             "rotary_dim": config.rotary_dim,
+            "mask_value": -1e9,
+            "use_positional_embedding": False,
+            "parallel_attn_output": True,
+            "use_lm_head_bias": True,
+            "tie_input_output_embedding": config.tie_word_embeddings,
+            "use_attn_dense_bias": False,
+            "use_qkv_bias": False,
+            "final_layernorm": True,
+            "single_pre_layernorm": True,
             "vocab_size": config.vocab_size,
             "activation": "gelu" if config.activation_function == "gelu_new" else "relu",
             "add_lm_head": True,
@@ -48,17 +65,19 @@ if hf_transformers_available:
             else 4 * config.n_embd,
             "attention_dropout_prob": config.attn_pdrop,
             "hidden_dropout_prob": config.resid_pdrop,
+            "embedding_dropout_prob": config.embd_pdrop,
             "layernorm_epsilon": config.layer_norm_epsilon,
-            "add_cross_attention": config.add_cross_attention,
+            "add_cross_attention": False,
             "initializer_range": config.initializer_range,
             "use_normal_initialization": True,
-            "pre_layernorm": True,
-            "post_layernorm": True,
+            "pre_layernorm": False,
+            "post_layernorm": False,
             "causal_mask_size": config.n_positions,
             "num_positions": config.n_positions,
+            "scale_attention_scores": config.scale_attn_weights,
             "_scale_qkv_fan_out": True,
             "query_key_layer_scaling": False,
-            "attention_in_fp32":False,
+            "attention_in_fp32": False,
         }
 
         return (), kwargs
@@ -87,11 +106,11 @@ if hf_transformers_available:
             or output_attentions
             or output_hidden_states
         ):
-            raise ValueError(
+            raise HFGPTJConfigError(
                 f"past_key_values, inputs_embeds, head_mask, use_cache, output_attentions, and output_hidden_states arguments of HuggingFace GPTJForCausalLM forward method are not supported."
             )
         if return_dict is not None and bool(return_dict) == False:
-            raise ValueError(
+            raise HFGPTJConfigError(
                 "Setting False for the return_dict argument of HuggingFace GPTJForCausalLM forward method is not supported."
             )
 
@@ -119,7 +138,7 @@ if hf_transformers_available:
             attentions=None,
         )
 
-    def translate_hf_state_dict_to_smdistributed(state_dict, max_seq_len):
+    def translate_hf_state_dict_to_smdistributed_gptj(state_dict):
         """ For optimize == 'speed' only """
 
         translated_state_dict = {}
@@ -140,7 +159,7 @@ if hf_transformers_available:
 
                 if block == "mlp":
                     layer = tokens[4]
-                    dense_idx = "1" if layer == "c_fc" else "2"
+                    dense_idx = "1" if layer == "fc_in" else "2"
 
                     translated_name = (
                         "transformer.seq_layers."
@@ -150,69 +169,47 @@ if hf_transformers_available:
                         + "."
                         + param_type
                     )
-                    if param_type == "weight":
-                        translated_param = param.t()
-                    else:
-                        translated_param = param
+                    translated_param = param
 
                     translated_state_dict[translated_name] = translated_param
 
                 elif block == "attn":
                     layer = tokens[4]
-                    if layer == "c_proj":
+                    if layer == "out_proj":
                         translated_name = (
                             "transformer.seq_layers." + layer_idx + ".attention.dense." + param_type
                         )
-                        if param_type == "weight":
-                            translated_param = param.t()
-                        else:
-                            translated_param = param
+                        translated_param = param
 
                         translated_state_dict[translated_name] = translated_param
-                    elif layer == "c_attn":
-                        query_name = (
-                            "transformer.seq_layers." + layer_idx + ".attention.query." + param_type
-                        )
-                        key_name = (
+                    if layer == "k_proj":
+                        translated_name = (
                             "transformer.seq_layers." + layer_idx + ".attention.key." + param_type
                         )
-                        value_name = (
+                        translated_param = param
+
+                        translated_state_dict[translated_name] = translated_param
+                    if layer == "v_proj":
+                        translated_name = (
                             "transformer.seq_layers." + layer_idx + ".attention.value." + param_type
                         )
+                        translated_param = param
 
-                        if param_type == "weight":
-                            attention_size = param.size(1) // 3
-                            mod_q_param = param.narrow(1, 0, attention_size).t()
-                            mod_k_param = param.narrow(1, attention_size, attention_size).t()
-                            mod_v_param = param.narrow(1, 2 * attention_size, attention_size).t()
-                        else:
-                            attention_size = param.size(0) // 3
-                            mod_q_param = param.narrow(0, 0, attention_size)
-                            mod_k_param = param.narrow(0, attention_size, attention_size)
-                            mod_v_param = param.narrow(0, 2 * attention_size, attention_size)
+                        translated_state_dict[translated_name] = translated_param
+                    if layer == "q_proj":
+                        translated_name = (
+                            "transformer.seq_layers." + layer_idx + ".attention.query." + param_type
+                        )
+                        translated_param = param
 
-                        translated_state_dict[query_name] = mod_q_param
-                        translated_state_dict[key_name] = mod_k_param
-                        translated_state_dict[value_name] = mod_v_param
-                elif block in ["ln_1", "ln_2"]:
-                    att_vs_out = "attention" if block == "ln_1" else "output"
+                        translated_state_dict[translated_name] = translated_param
+                elif block == "ln_1":
                     translated_name = (
-                        "transformer.seq_layers."
-                        + layer_idx
-                        + "."
-                        + att_vs_out
-                        + ".pre_layernorm."
-                        + param_type
+                        "transformer.seq_layers." + layer_idx + ".pre_layernorm." + param_type
                     )
                     translated_state_dict[translated_name] = param
             elif tokens[:2] == ["transformer", "ln_f"]:
-                translated_name = (
-                    "transformer.seq_layers."
-                    + str(last_layer)
-                    + "."
-                    + "output.layernorm."
-                    + param_type
-                )
+                translated_name = "layernorm." + param_type
                 translated_state_dict[translated_name] = param
             elif tokens[:2] == ["transformer", "wte"]:
                 translated_name = "word_embedding." + param_type
@@ -222,7 +219,16 @@ if hf_transformers_available:
 
         return translated_state_dict
 
-    def translate_state_dict_to_hf_gptj(state_dict, max_seq_len):
+    # For backward compatibility
+    translate_hf_gptj_state_dict_to_smdistributed = lambda state_dict, max_seq_len: translate_hf_state_dict_to_smdistributed_gptj(
+        state_dict
+    )
+
+    def translate_state_dict_to_hf_gptj(state_dict, max_seq_len=None):
+        if max_seq_len is None:
+            global max_seq_len_gptj
+            max_seq_len = max_seq_len_gptj
+
         translated_state_dict = {}
 
         qkv = []
@@ -238,63 +244,30 @@ if hf_transformers_available:
                 ).view(1, 1, max_seq_len, max_seq_len)
                 translated_state_dict[
                     "transformer.h." + layer_id + ".attn.masked_bias"
-                ] = torch.tensor(-1e4)
-
-            if tokens[-2] in ["query", "key", "value"]:
-                qkv.append((tokens, param))
-                continue
+                ] = torch.tensor(-1e9)
 
             if tokens[0] == "lm_head":
                 translated_name, translated_param = name, param
+            elif tokens[0] == "layernorm":
+                translated_name, translated_param = get_layernorm_translation(tokens[1], param)
             elif tokens[0] == "word_embedding":
                 translated_name, translated_param = get_word_embedding_translation(tokens[1], param)
             elif tokens[0] == "transformer":
-                translated_name, translated_param = get_transformer_translation(tokens[2:], param)
+                if tokens[3] == "output" and tokens[4] in ["pre_layernorm", "layernorm"]:
+                    pass
+                else:
+                    translated_name, translated_param = get_transformer_translation(
+                        tokens[2:], param
+                    )
             else:
-                raise ValueError(f"Unknown token {tokens[0]}.")
+                raise HFGPTJConfigError(f"Unknown token {tokens[0]}.")
 
             translated_state_dict[translated_name] = translated_param
 
-        qkv_dict = handle_qkv(qkv)
-        translated_state_dict.update(qkv_dict)
-
         return translated_state_dict
 
-    def handle_qkv(qkv_list):
-        qkv_dict = {}
-
-        for tokens, param in qkv_list:
-            translated_name = "transformer.h." + tokens[2] + ".attn.c_attn." + tokens[5]
-
-            if tokens[4] == "query":
-                slice_ind = 0
-            elif tokens[4] == "key":
-                slice_ind = 1
-            elif tokens[4] == "value":
-                slice_ind = 2
-            else:
-                raise ValueError(f"Unrecognized token {tokens[2]}.")
-
-            if translated_name not in qkv_dict:
-                scaled_shape = list(param.shape)
-                scaled_shape[0] *= 3
-                qkv_dict[translated_name] = torch.empty(
-                    *scaled_shape[::-1], dtype=param.dtype, device=param.device
-                )
-
-            slice_size = param.shape[0]
-            if tokens[5] == "weight":
-                weight_slice = qkv_dict[translated_name].narrow(
-                    1, slice_ind * slice_size, slice_size
-                )
-                weight_slice.copy_(param.t())
-            else:
-                weight_slice = qkv_dict[translated_name].narrow(
-                    0, slice_ind * slice_size, slice_size
-                )
-                weight_slice.copy_(param)
-
-        return qkv_dict
+    def get_layernorm_translation(name, param):
+        return "transformer.ln_f." + name, param
 
     def get_word_embedding_translation(name, param):
         return "transformer.wte." + name, param
@@ -302,28 +275,31 @@ if hf_transformers_available:
     def get_transformer_translation(tokens, param):
         # tokens = [<layer_id>, <attention/output>, ...]
 
+        prefix = "transformer.h." + tokens[0] + "."
         block = tokens[1]
+
+        if block == "pre_layernorm":
+            return prefix + "ln_1." + tokens[2], param
+
         layer = tokens[2]
         param_type = tokens[3]
-        prefix = "transformer.h." + tokens[0] + "."
 
         if block == "output" and layer == "dense1":
-            return prefix + "mlp.c_fc." + param_type, param.t()
+            return prefix + "mlp.fc_in." + param_type, param
 
         if block == "output" and layer == "dense2":
-            return prefix + "mlp.c_proj." + param_type, param.t()
-
-        if block == "output" and layer == "pre_layernorm":
-            return prefix + "ln_2." + param_type, param
-
-        if block == "output" and layer == "layernorm":
-            # final layernorm
-            return "transformer.ln_f." + param_type, param
+            return prefix + "mlp.fc_out." + param_type, param
 
         if block == "attention" and layer == "dense":
-            return prefix + "attn.c_proj." + param_type, param.t()
+            return prefix + "attn.out_proj." + param_type, param
 
-        if block == "attention" and layer == "pre_layernorm":
-            return prefix + "ln_1." + param_type, param
+        if block == "attention" and layer == "query":
+            return prefix + "attn.q_proj." + param_type, param
 
-        raise ValueError(f"Unknown tokens {tokens}.")
+        if block == "attention" and layer == "key":
+            return prefix + "attn.k_proj." + param_type, param
+
+        if block == "attention" and layer == "value":
+            return prefix + "attn.v_proj." + param_type, param
+
+        raise HFGPTJConfigError(f"Unknown tokens {tokens}.")

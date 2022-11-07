@@ -5,27 +5,17 @@ import argparse
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.optim import SGD, Adam, Adamax, AdamW, RMSprop
 
 # First Party
 import smdistributed.modelparallel.torch as smp
+from smdistributed.modelparallel.test.torch.model_zoo.smp_test_model import OPTIMIZERS
 from smdistributed.modelparallel.test.torch.utils import ATOL, equalize_linear_weights
 from smdistributed.modelparallel.torch.state_mod import state
 from smdistributed.modelparallel.torch.tp_registry import get_weight_slice
 
 NUM_STEPS = 50
-ATOL = 2e-4
-
-# (optimizer, learning_rate, weight_decay)
-# Adamax and RMSprop get smaller learning rate because the lack of bias correction in gradient moments
-# causes very large updates in the first steps
-OPTIMIZERS = [
-    (Adam, 1e-3, 0.0),
-    (AdamW, 1e-3, 0.1),
-    (SGD, 1e-3, 0.1),
-    (Adamax, 1e-4, 0.1),
-    (RMSprop, 1e-4, 0.0),
-]
+# Adjusted ATOL for PT1.11 tests on P4 Instances
+ATOL = 4e-3
 
 
 def print_stats(p, original_param):
@@ -203,7 +193,10 @@ def compare_params(tp_degree, pp_degree, microbatches, opt_class, lr, wd):
 
 
 def main(args):
-    for opt, lr, wd in OPTIMIZERS:
+    for item in OPTIMIZERS.values():
+        opt = item[0]
+        lr = item[1]["lr"]
+        wd = item[1]["weight_decay"]
         compare_params(
             args.tensor_parallel_degree,
             args.pipeline_parallel_degree,

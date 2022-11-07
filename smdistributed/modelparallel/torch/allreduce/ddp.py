@@ -6,6 +6,7 @@ from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 # First Party
 from smdistributed.modelparallel.backend.logger import get_logger
 from smdistributed.modelparallel.torch.allreduce.reducer import GradReducer
+from smdistributed.modelparallel.torch.exceptions import DDPConfigError
 
 logger = get_logger()
 
@@ -55,13 +56,13 @@ class DdpNonOverlappingAllreducer(GradReducer):
     def _validate_config(self, ddp_config):
         supported_configs = ["reduce_after", "fp32_allreduce"]
         if any([k not in supported_configs for k in ddp_config.keys()]):
-            raise ValueError(
+            raise DDPConfigError(
                 f"Only the following ddp_config keys are supported {supported_configs}"
             )
         if "reduce_after" in ddp_config and ddp_config["reduce_after"] not in [False, True]:
-            raise ValueError("reduce_after in ddp_config can only be True or False")
+            raise DDPConfigError("reduce_after in ddp_config can only be True or False")
         if "fp32_allreduce" in ddp_config and ddp_config["fp32_allreduce"] not in [False, True]:
-            raise ValueError("fp32_allreduce in ddp_config can only be True or False")
+            raise DDPConfigError("fp32_allreduce in ddp_config can only be True or False")
 
     def _set_forward_pass_work_handle(self, work, use_static_world_size):
         self.fwd_pass_work_handle = work

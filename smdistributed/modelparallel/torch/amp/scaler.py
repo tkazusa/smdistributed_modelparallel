@@ -11,11 +11,13 @@ from torch.cuda.amp.grad_scaler import OptState, _refresh_per_optimizer_state
 from smdistributed.modelparallel.backend.logger import get_logger
 from smdistributed.modelparallel.torch.comm import CommGroup, allgather
 from smdistributed.modelparallel.torch.core import local_rank, pp_rank
+from smdistributed.modelparallel.torch.exceptions import SMPAMPError
 
 # TODO: update this file with changes made in PT 1.8 for typechecking
 # no functionality change in 1.8
 
 _pt_19_or_newer = LooseVersion(torch.__version__) >= LooseVersion("1.9.0")
+
 
 class GradScaler(TorchGradScaler):
     def __init__(self, *args, **kwargs):
@@ -53,9 +55,12 @@ class GradScaler(TorchGradScaler):
                 )
             else:
                 reason = "new_scale should be a float or a 1-element torch.cuda.FloatTensor with requires_grad=False."
-                assert isinstance(new_scale, torch.cuda.FloatTensor), reason
-                assert new_scale.numel() == 1, reason
-                assert new_scale.requires_grad is False, reason
+                if (
+                    not isinstance(new_scale, torch.cuda.FloatTensor)
+                    or new_scale.numel() != 1
+                    or new_scale.requires_grad
+                ):
+                    raise SMPAMPError(reason)
                 self._scale = new_scale
         else:
             # Consume shared inf/nan data collected from optimizers to update the scale.
@@ -66,7 +71,8 @@ class GradScaler(TorchGradScaler):
                 for found_inf in state["found_inf_per_device"].values()
             ]
 
-            assert len(found_infs) > 0, "No inf checks were recorded prior to update."
+            if len(found_infs) <= 0:
+                raise SMPAMPError("No inf checks were recorded prior to update.")
 
             found_inf_combined = found_infs[0]
             if len(found_infs) > 1:
@@ -125,7 +131,7 @@ class GradScaler(TorchGradScaler):
             return optimizer.step(*args, **kwargs)
 
         if "closure" in kwargs:
-            raise RuntimeError("Closure use is not currently supported if GradScaler is enabled.")
+            raise SMPAMPError("Closure use is not currently supported if GradScaler is enabled.")
 
         if pp_rank() != 0 and self._scale is None:
             self._lazy_init_scale_growth_tracker(torch.device("cuda", local_rank()))
@@ -134,7 +140,7 @@ class GradScaler(TorchGradScaler):
         optimizer_state = self._per_optimizer_states[id(optimizer)]
 
         if optimizer_state["stage"] is OptState.STEPPED:
-            raise RuntimeError("step() has already been called since the last update().")
+            raise SMPAMPError("step() has already been called since the last update().")
 
         retval = None
 
@@ -169,9 +175,8 @@ class GradScaler(TorchGradScaler):
                     self.local_device: torch.zeros((1,), device=self.local_device)
                 }
 
-        assert (
-            len(optimizer_state["found_inf_per_device"]) > 0
-        ), "No inf checks were recorded for this optimizer."
+        if len(optimizer_state["found_inf_per_device"]) <= 0:
+            raise SMPAMPError("No inf checks were recorded for this optimizer.")
 
         local_infinite = sum(v.item() for v in optimizer_state["found_inf_per_device"].values())
 

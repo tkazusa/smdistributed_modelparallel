@@ -4,6 +4,7 @@ from abc import ABCMeta, abstractmethod
 from collections import defaultdict
 
 # First Party
+from smdistributed.modelparallel.backend.exceptions import InvalidStepOutputError, TensorSplitError
 from smdistributed.modelparallel.backend.logger import get_logger
 
 NATIVE_TYPES = [str, int, float, bytes, bytearray, bool, type(None)]
@@ -24,10 +25,10 @@ class TensorSplitter(metaclass=ABCMeta):
         types_to_suppress_warn=None,
     ):
         if non_split_inputs is not None and not isinstance(non_split_inputs, list):
-            raise TypeError("Non-split inputs must be a list.")
+            raise TensorSplitError("Non-split inputs must be a list.")
 
         if input_split_axes is not None and not isinstance(input_split_axes, dict):
-            raise TypeError("input_split_axes must be a dict.")
+            raise TensorSplitError("input_split_axes must be a dict.")
 
         self.func = func
         self.non_split_inputs = non_split_inputs if non_split_inputs is not None else []
@@ -78,13 +79,13 @@ class TensorSplitter(metaclass=ABCMeta):
         arg_names = inspect.getfullargspec(self.func).args
 
         if len(set(self.non_split_inputs).difference(set(arg_names))) > 0:
-            raise ValueError(
+            raise TensorSplitError(
                 "Non-split inputs list %s contains a non-argument of %s."
                 % (self.non_split_inputs, self.func.__name__)
             )
 
         if len(set(self.input_split_axes.keys()).difference(set(arg_names))) > 0:
-            raise ValueError(
+            raise TensorSplitError(
                 "Input split axes dict %s contains a non-argument key of %s."
                 % (self.input_split_axes, self.func.__name__)
             )
@@ -177,7 +178,9 @@ class TensorSplitter(metaclass=ABCMeta):
 class StepOutput(metaclass=ABCMeta):
     def __init__(self, outputs):
         if not isinstance(outputs, list) and not isinstance(outputs, tuple):
-            raise ValueError(f"StepOutput only accepts list or tuple, but get {type(outputs)}")
+            raise InvalidStepOutputError(
+                f"StepOutput only accepts list or tuple, but get {type(outputs)}"
+            )
         self._outputs = outputs
 
     def __getitem__(self, index):

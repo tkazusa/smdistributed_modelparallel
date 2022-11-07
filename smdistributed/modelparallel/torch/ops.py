@@ -11,6 +11,12 @@ from torch.cuda.amp import custom_bwd, custom_fwd
 # First Party
 from smdistributed.modelparallel.backend.logger import get_logger
 from smdistributed.modelparallel.torch import smplib
+from smdistributed.modelparallel.torch.exceptions import (
+    InvalidBwdCountError,
+    PipelineParallelBWDError,
+    SMPRuntimeError,
+    SMPUnsupportedError,
+)
 from smdistributed.modelparallel.torch.messages import ModuleExecutionRequest
 from smdistributed.modelparallel.torch.module_manager import TensorModuleInfo
 from smdistributed.modelparallel.torch.state_mod import state
@@ -30,7 +36,7 @@ def get_fn(type: str):
     if hasattr(smplib, fn_name):
         return getattr(smplib, fn_name)
     else:
-        raise NotImplementedError("Queried function does not exist in smplib")
+        raise SMPUnsupportedError("Queried function does not exist in smplib")
 
 
 def send(
@@ -73,9 +79,10 @@ def recv(
     if metadata == None:
         handle = get_fn("recv")(tensor, rank, link_id, name, server)
     else:
-        assert isinstance(
-            metadata, smplib.TorchTensorMeta
-        ), f"metadata must be TorchTensorMeta type, but got {type(metadata)}"
+        if not isinstance(metadata, smplib.TorchTensorMeta):
+            raise SMPRuntimeError(
+                f"metadata must be TorchTensorMeta type, but got {type(metadata)}"
+            )
         handle = get_fn("recv")(tensor, rank, link_id, name, metadata, server)
     # actual recv tensor can change if dtype was not sent
     # we will need to create a new tensor then
@@ -184,7 +191,8 @@ class SMPSequentialInput(torch.autograd.Function):
         Otherwise, allows backward pass to continue.
         """
         ctx.pending_smpinput_bwds -= 1
-        assert ctx.pending_smpinput_bwds >= 0, "Pending smpinput bwd count is less than 0"
+        if ctx.pending_smpinput_bwds < 0:
+            raise InvalidBwdCountError
         ctx.out_grads = aggregate_grads(ctx.out_grads, out_grads)
         if not ctx.is_main and not ctx.is_parent_executor and ctx.pending_smpinput_bwds == 0:
             if state.cfg.fast_mode:
@@ -259,7 +267,8 @@ class SMPInput(torch.autograd.Function):
         Otherwise, allows backward pass to continue.
         """
         ctx.pending_smpinput_bwds -= 1
-        assert ctx.pending_smpinput_bwds >= 0, "Pending smpinput bwd count is less than 0"
+        if ctx.pending_smpinput_bwds < 0:
+            raise InvalidBwdCountError
         ctx.out_grads = aggregate_grads(ctx.out_grads, out_grads)
         if not ctx.is_main and not ctx.is_parent_executor and ctx.pending_smpinput_bwds == 0:
             if state.cfg.fast_mode:
@@ -317,10 +326,11 @@ class SMPParentRecv(torch.autograd.Function):
         ctx.parent_module = parent_module
         ctx.execution_stack = state.module_manager.execution_stack
         ctx.bwd_req_count = count
-        assert (
+        if (
             state.module_manager.output_stack_size(state.microbatch, ctx.module, ctx.parent_module)
-            > 0
-        ), "output_stack_size should be greater than 0, this is a bug"
+            <= 0
+        ):
+            raise SMPRuntimeError("output_stack_size should be greater than 0, this is a bug")
         ctx.position = (
             state.module_manager.output_stack_size(state.microbatch, ctx.module, ctx.parent_module)
             - 1
@@ -344,9 +354,10 @@ class SMPParentRecv(torch.autograd.Function):
         and returns
         """
         ctx.next_parent_recvs_bwd_pending -= 1
-        assert (
-            ctx.next_parent_recvs_bwd_pending >= 0
-        ), "Pending parent recvs for this backward can not be less than 0"
+        if ctx.next_parent_recvs_bwd_pending < 0:
+            raise PipelineParallelBWDError(
+                "Pending parent recvs for this backward can not be less than 0"
+            )
 
         ctx.out_grads = aggregate_grads(ctx.out_grads, out_grads)
 

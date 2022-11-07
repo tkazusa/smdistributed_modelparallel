@@ -1,6 +1,9 @@
 # Standard Library
 from collections.abc import Iterable
 
+# First Party
+from smdistributed.modelparallel.torch.exceptions import HFRobertaConfigError
+
 try:
     from transformers.models.roberta.modeling_roberta import (
         BaseModelOutputWithPastAndCrossAttentions,
@@ -10,9 +13,10 @@ try:
 except ImportError:
     hf_transformers_available = False
 
+
 if hf_transformers_available:
 
-    def translate_hf_state_dict_to_smdistributed(state_dict):
+    def translate_hf_state_dict_to_smdistributed_roberta(state_dict):
         translated_state_dict = {}
 
         for name, param in state_dict.items():
@@ -54,6 +58,9 @@ if hf_transformers_available:
             translated_state_dict[translated_name] = param
 
         return translated_state_dict
+
+    # For backward compatibility
+    translate_hf_state_dict_to_smdistributed = translate_hf_state_dict_to_smdistributed_roberta
 
     def translate_state_dict_to_hf_roberta(state_dict):
         translated_state_dict = {}
@@ -113,30 +120,34 @@ if hf_transformers_available:
     ):
         if head_mask is not None:
             if not isinstance(head_mask, Iterable) or any([m is not None for m in head_mask]):
-                raise ValueError(
+                raise HFRobertaConfigError(
                     "head_mask argument of HuggingFace RobertaEncoder is not supported."
                 )
 
         if past_key_values is not None:
-            raise ValueError(
+            raise HFRobertaConfigError(
                 "past_key_values argument of HuggingFace RobertaEncoder is not supported."
             )
 
         if use_cache:
-            raise ValueError("use_cache argument of HuggingFace RobertaEncoder is not supported.")
+            raise HFRobertaConfigError(
+                "use_cache argument of HuggingFace RobertaEncoder is not supported."
+            )
 
         if output_attentions or output_hidden_states:
-            raise ValueError(
+            raise HFRobertaConfigError(
                 "output_attentions and output_hidden_states arguments of HuggingFace RobertaEncoder are not supported."
             )
 
         if return_dict is not None and bool(return_dict) == False:
-            raise ValueError(
+            raise HFRobertaConfigError(
                 "Setting False for the return_dict argument of HuggingFace RobertaEncoder forward method is not supported."
             )
 
         if attention_mask is None:
-            raise ValueError("attention_mask is a required argument of DistributedTransformer.")
+            raise HFRobertaConfigError(
+                "attention_mask is a required argument of DistributedTransformer."
+            )
 
         if encoder_hidden_states is not None:
             input_tuple = (
@@ -161,12 +172,12 @@ if hf_transformers_available:
 
     def hf_roberta_transformer_init_hook(config):
         if config.hidden_size % config.num_attention_heads != 0:
-            raise ValueError(
+            raise HFRobertaConfigError(
                 f"Hidden size ({config.hidden_size}) must be divisible by the number of attention heads ({config.num_attention_heads}) for HuggingFace RoBERTa model."
             )
 
         if config.position_embedding_type != "absolute":
-            raise ValueError(
+            raise HFRobertaConfigError(
                 "Only position_embedding_type=='absolute' is supported for HuggingFace RoBERTa model."
             )
 
@@ -176,6 +187,7 @@ if hf_transformers_available:
             "attention_head_size": config.hidden_size // config.num_attention_heads,
             "hidden_size": config.hidden_size,
             "intermediate_size": config.intermediate_size,
+            "activation": config.hidden_act,
             "attention_dropout_prob": config.attention_probs_dropout_prob,
             "hidden_dropout_prob": config.hidden_dropout_prob,
             "layernorm_epsilon": config.layer_norm_eps,

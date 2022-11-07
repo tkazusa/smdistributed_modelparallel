@@ -236,6 +236,12 @@ def main():
         default=False,
         help="For Saving the current Model",
     )
+    parser.add_argument(
+        "--back_compat",
+        action="store_true",
+        default=False,
+        help="Load the old checkpoint in back compatible mode",
+    )
     parser.add_argument("--load-in-hook", type=int, default=0)
     parser.add_argument("--num-microbatches", type=int, default=4)
     parser.add_argument("--num-batches", type=int, default=0)
@@ -262,7 +268,7 @@ def main():
         "horovod": use_horovod,
         "ddp": use_ddp,
         "_fp32_grad_accumulation": args.fp32_grad_accumulation > 0,
-        "fp16_params": args.fp32_grad_accumulation > 0,
+        "fp16": args.fp32_grad_accumulation > 0,
     }
 
     smp.init(cfg)
@@ -315,13 +321,15 @@ def main():
     optimizer = smp.DistributedOptimizer(optimizer)
 
     if args.partial_checkpoint:
-        checkpoint = smp.load(args.partial_checkpoint, partial=True)
+        checkpoint = smp.load(args.partial_checkpoint, partial=True, back_compat=args.back_compat)
 
         def model_optim_callable(model, optimizer):
             model.load_state_dict(checkpoint["model_state_dict"])
             optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
 
         if args.load_in_hook:
+            # delete partition_info as loading happened after partition
+            del checkpoint["model_state_dict"]["_smp_load_info"]["partition_info"]
             model.register_post_partition_hook(model_optim_callable)
         else:
             model_optim_callable(model, optimizer)
@@ -339,7 +347,9 @@ def main():
         else:
             model_optim_callable(model, optimizer)
 
-    scheduler = StepLR(optimizer, step_size=1, gamma=args.gamma)
+    opt = optimizer.optimizer if args.fp32_grad_accumulation > 0 else optimizer
+
+    scheduler = StepLR(opt, step_size=1, gamma=args.gamma)
 
     test_loss = test(args, model, device, test_loader)
     test_loss_equal(args, device, test_loss)

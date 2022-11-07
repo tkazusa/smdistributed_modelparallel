@@ -7,7 +7,11 @@ import torch
 # First Party
 from smdistributed.modelparallel.backend.logger import get_logger
 from smdistributed.modelparallel.torch.core import pp_rank
-from smdistributed.modelparallel.torch.exceptions import InvalidExecutor
+from smdistributed.modelparallel.torch.exceptions import (
+    CheckpointingError,
+    InvalidExecutorError,
+    SequentialBackwardBrokenError,
+)
 from smdistributed.modelparallel.torch.graph_utils import get_ancestors
 from smdistributed.modelparallel.torch.messages import SequentialModulesExecutionRequest
 from smdistributed.modelparallel.torch.module_manager import TensorModuleInfo
@@ -16,9 +20,11 @@ from smdistributed.modelparallel.torch.ops import SMPParentRecv, SMPSequentialIn
 from smdistributed.modelparallel.torch.patches.checkpoint import (
     CheckpointTupledFunction,
     checkpoint_function,
+    validate_checkpointable,
     validate_checkpointable_sequential,
 )
 from smdistributed.modelparallel.torch.patches.execution import (
+    actual_forward,
     detach_outputs,
     execute_as_parent,
     increment_smp_input_bwd_counts,
@@ -74,12 +80,10 @@ def execute_chain_maybe_with_checkpointing(self, exec_fn, start_index, end_index
         config = state.module_manager.get_checkpoint_activations_config(self)
         outputs = checkpoint_function(
             exec_fn,
-            start_index,
-            end_index,
-            *args,
+            (start_index, end_index, *args),
+            {},
             module_name=state.module_manager.get_module_name(self),
             preserve_rng_state=config.preserve_rng_state,
-            pack_args_as_tuple=config.pack_args_as_tuple,
             strategy=config.strategy,
         )
     else:
@@ -117,9 +121,27 @@ def execute_chain(self, start_index, end_index, *args):
                 # If no tensors require grads, we still need to send a dummy request back from the child
                 if num_tensors_requiring_grad == 0:
                     num_tensors_requiring_grad += 1
-            original_forward = state.patch_manager.get_original_method("forward", module.__class__)
             send_real_bwd = send_real_bwd and check_requires_grad(input)
-            input = original_forward(module, input)
+            kwargs = {}
+            if (
+                state.module_manager.should_checkpoint_activations(module)
+                and not state.checkpoint_activations_config.enabled_for_module(module)
+                and validate_checkpointable(module)
+                and torch.is_grad_enabled()
+            ):
+                # only modules set with set_activation_checkpointing will match this condition
+                # for calls of checkpoint and checkpoint_sequential, this context manager will already be set
+                config = state.module_manager.get_checkpoint_activations_config(module)
+                input = checkpoint_function(
+                    actual_forward,
+                    (module, input),
+                    kwargs,
+                    module_name=state.module_manager.get_module_name(module),
+                    preserve_rng_state=config.preserve_rng_state,
+                )
+            else:
+                input = actual_forward(module, input, **kwargs)
+
             if idx == end_index - 1:
                 outputs = input
                 if not state.module_manager.is_parent_executor(module):
@@ -132,7 +154,6 @@ def execute_chain(self, start_index, end_index, *args):
         return outputs, send_real_bwd, num_tensors_requiring_grad
     else:
         preserve_rng_state = state.checkpoint_activations_config.preserve_rng_state
-        pack_args_as_tuple = state.checkpoint_activations_config.pack_args_as_tuple
         strategy = state.checkpoint_activations_config.strategy  # can take contiguous or each
 
         # args has an extra tuple around input
@@ -151,9 +172,10 @@ def execute_chain(self, start_index, end_index, *args):
                     input = original_forward(functions[j], input)
                     # if seq is being executed in a no_grad block, then we don't checkpoint so it doesn't come here
                     if not check_requires_grad(input):
-                        raise RuntimeError(
-                            f"Backward is broken in between sequential because there was no tensor which required gradients "
-                            f"in one of the layer's {state.module_manager.get_module_name(functions[j])} outputs. {torch.is_grad_enabled(), input}"
+                        raise SequentialBackwardBrokenError(
+                            state.module_manager.get_module_name(functions[j]),
+                            torch.is_grad_enabled(),
+                            input,
                         )
                     state.module_manager.finished_module_exec()
                 _maybe_mark_module_info(self, input, end + 1)
@@ -169,23 +191,18 @@ def execute_chain(self, start_index, end_index, *args):
                 # unpack here so autograd fn doesnt get a tuple of tensors
                 # if autograd fn gets tuple backward gets messed up.
                 # it needs top level tensors
-                if pack_args_as_tuple:
-                    # then expand now
-                    input = CheckpointTupledFunction.apply(
-                        run_function(0, len(functions) - 1, functions),
-                        preserve_rng_state,
-                        pack_args_as_tuple,
-                        can_shard_activation_offloading(functions[0]),
-                        *input,
-                    )
-                else:
-                    input = CheckpointTupledFunction.apply(
-                        run_function(0, len(functions) - 1, functions),
-                        preserve_rng_state,
-                        pack_args_as_tuple,
-                        can_shard_activation_offloading(functions[0]),
-                        input,
-                    )
+
+                wrapping_obj, tensors = state.serialization_manager.serialize(
+                    ((input,), {}), for_transmission=False
+                )
+
+                input = CheckpointTupledFunction.apply(
+                    run_function(0, len(functions) - 1, functions),
+                    preserve_rng_state,
+                    can_shard_activation_offloading(functions[0]),
+                    wrapping_obj,
+                    *tensors,
+                )
         elif strategy == "each":
             # checkpoints one layer at a time
             if len(functions) > 0:
@@ -195,28 +212,23 @@ def execute_chain(self, start_index, end_index, *args):
                     )
                 )
             for j in range(0, len(functions)):
+                wrapping_obj, tensors = state.serialization_manager.serialize(
+                    ((input,), {}), for_transmission=False
+                )
+
                 # unpack here so autograd fn doesnt get a tuple of tensors
-                if pack_args_as_tuple:
-                    input = CheckpointTupledFunction.apply(
-                        run_function(j, j, functions),
-                        preserve_rng_state,
-                        pack_args_as_tuple,
-                        can_shard_activation_offloading(functions[j]),
-                        *input,
-                    )
-                else:
-                    input = CheckpointTupledFunction.apply(
-                        run_function(j, j, functions),
-                        preserve_rng_state,
-                        pack_args_as_tuple,
-                        can_shard_activation_offloading(functions[j]),
-                        input,
-                    )
+                input = CheckpointTupledFunction.apply(
+                    run_function(j, j, functions),
+                    preserve_rng_state,
+                    can_shard_activation_offloading(functions[j]),
+                    wrapping_obj,
+                    *tensors,
+                )
         elif "group_" in strategy:
             try:
                 group_by_n = int(strategy.split("group_")[1])
             except ValueError:
-                raise ValueError(
+                raise CheckpointingError(
                     f"Expected strategy to be of the form `group_x` where x is an integer. Found strategy value to be {strategy}"
                 )
 
@@ -235,26 +247,21 @@ def execute_chain(self, start_index, end_index, *args):
                     end = len(functions) - 1
 
                 if end >= start:
-                    if pack_args_as_tuple:
-                        input = CheckpointTupledFunction.apply(
-                            run_function(start, end, functions),
-                            preserve_rng_state,
-                            pack_args_as_tuple,
-                            can_shard_activation_offloading(functions[start]),
-                            *input,
-                        )
-                    else:
-                        input = CheckpointTupledFunction.apply(
-                            run_function(start, end, functions),
-                            preserve_rng_state,
-                            pack_args_as_tuple,
-                            can_shard_activation_offloading(functions[start]),
-                            input,
-                        )
+                    wrapping_obj, tensors = state.serialization_manager.serialize(
+                        ((input,), {}), for_transmission=False
+                    )
+
+                    input = CheckpointTupledFunction.apply(
+                        run_function(start, end, functions),
+                        preserve_rng_state,
+                        can_shard_activation_offloading(functions[start]),
+                        wrapping_obj,
+                        *tensors,
+                    )
                 else:
                     break
         else:
-            raise ValueError(f"Invalid strategy: {strategy}")
+            raise CheckpointingError(f"Invalid strategy: {strategy}")
 
         outputs = input
 
@@ -329,9 +336,10 @@ def execute_chain_remotely(self, start_index, end_index, input):
             smp_child_inputs, checkpoint_nodes_cache=state.checkpoint_nodes_cache
         )
         params = params.union(additional_params)
-        state.model.grad_counter.increment_expected_num_grads(
-            state.microbatch, [state.model.get_param_name(p) for p in params]
-        )
+        if not state.cfg.zero2d_enabled():
+            state.model.grad_counter.increment_expected_num_grads(
+                state.microbatch, [state.model.get_param_name(p) for p in params]
+            )
         logger.debug(
             rmsg(
                 f"{len(params)} params are reachable from inputs of {state.module_manager.get_module_name(self[start_index])}"
@@ -409,6 +417,6 @@ def sequential_distributed_forward(self, input: Any):
     elif state.module_manager.is_parent_executor(self):
         return execute_as_parent(self, input)
     else:
-        raise InvalidExecutor(
+        raise InvalidExecutorError(
             state.module_manager.get_module_name(self), state.module_manager.get_partition(self)
         )

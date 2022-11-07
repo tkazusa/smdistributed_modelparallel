@@ -12,8 +12,9 @@ from transformers import (
     AutoConfig,
     AutoModelForCausalLM,
     AutoTokenizer,
-    GPTJConfig,
     GPT2Config,
+    GPTJConfig,
+    GPTNeoConfig,
     default_data_collator,
     set_seed,
 )
@@ -27,7 +28,15 @@ from smdistributed.modelparallel.test.torch.mpi_4ps.utils import (
 from smdistributed.modelparallel.test.torch.utils import (
     equalize_embedding_weights,
     equalize_linear_weights,
-    slice_and_compare_grads,
+)
+from smdistributed.modelparallel.torch.nn.huggingface.gpt2 import (
+    translate_hf_state_dict_to_smdistributed_gpt2,
+)
+from smdistributed.modelparallel.torch.nn.huggingface.gptj import (
+    translate_hf_state_dict_to_smdistributed_gptj,
+)
+from smdistributed.modelparallel.torch.nn.huggingface.gptneo import (
+    translate_hf_state_dict_to_smdistributed_gptneo,
 )
 
 torch.backends.cudnn.deterministic = True
@@ -135,6 +144,7 @@ def parse_args():
 
     smp_grp.add_argument("--microbatches", type=int, default=1)
     smp_grp.add_argument("--active_microbatches", type=int, default=None)
+    smp_grp.add_argument("--distribute_embedding", type=int, default=1)
     smp_grp.add_argument("--optimize", type=str, default="speed")
     smp_grp.add_argument(
         "--run_with_non_prescaled",
@@ -146,6 +156,7 @@ def parse_args():
     smp_grp.add_argument("--offload_activations", type=int, default=0)
 
     args, _ = parser.parse_known_args()
+    args.distribute_embedding = args.distribute_embedding and args.model_type == "gpt2"
     return args
 
 
@@ -184,14 +195,96 @@ def map_and_match_mod_weights(model, dist_model, args):
     for i, (mod, dist_mod, partition) in enumerate(module_mapping):
         equalize_linear_weights(mod, dist_mod, partition=partition)
     equalize_embedding_weights(
-        model.word_embedding, dist_model.module.module.module.word_embedding, split=False
+        model.word_embedding,
+        dist_model.module.module.module.word_embedding,
+        split=args.distribute_embedding > 0,
+        vocab_parallel=True,
     )
 
     if args.model_type == "gpt2":
         equalize_embedding_weights(
-            model.position_embedding, dist_model.module.module.module.position_embedding, split=False
+            model.position_embedding,
+            dist_model.module.module.module.position_embedding,
+            split=False,
         )
     return module_mapping
+
+
+def compare_weights(hf_layer, smp_layer, atol=1e-2):
+
+    assert torch.allclose(
+        hf_layer.attention.query.weight, smp_layer.attention.query.weight, atol=atol
+    )
+
+    if hasattr(hf_layer.attention.query, "bias") and hf_layer.attention.query.bias is not None:
+        assert torch.allclose(
+            hf_layer.attention.query.bias, smp_layer.attention.query.bias, atol=atol
+        )
+    assert torch.allclose(hf_layer.attention.key.weight, smp_layer.attention.key.weight, atol=atol)
+
+    if hasattr(hf_layer.attention.key, "bias") and hf_layer.attention.key.bias is not None:
+        assert torch.allclose(hf_layer.attention.key.bias, smp_layer.attention.key.bias, atol=atol)
+
+    assert torch.allclose(
+        hf_layer.attention.value.weight, smp_layer.attention.value.weight, atol=atol
+    )
+
+    if hasattr(hf_layer.attention.value, "bias") and hf_layer.attention.value.bias is not None:
+        assert torch.allclose(
+            hf_layer.attention.value.bias, smp_layer.attention.value.bias, atol=atol
+        )
+
+    assert torch.allclose(
+        hf_layer.attention.dense.weight, smp_layer.attention.dense.weight, atol=atol
+    )
+    assert torch.allclose(hf_layer.output.dense1.weight, smp_layer.output.dense1.weight, atol=atol)
+    assert torch.allclose(hf_layer.output.dense2.weight, smp_layer.output.dense2.weight, atol=atol)
+
+    if hasattr(hf_layer.output, "layernorm"):
+        assert torch.allclose(
+            hf_layer.output.layernorm.weight, smp_layer.output.layernorm.weight, atol=atol
+        )
+        assert torch.allclose(
+            hf_layer.output.layernorm.bias, smp_layer.output.layernorm.bias, atol=atol
+        )
+
+    if hasattr(hf_layer.output, "pre_layernorm") and hf_layer.output.pre_layernorm:
+        assert torch.allclose(
+            hf_layer.output.pre_layernorm.weight, smp_layer.output.pre_layernorm.weight, atol=atol
+        )
+        assert torch.allclose(
+            hf_layer.output.pre_layernorm.bias, smp_layer.output.pre_layernorm.bias, atol=atol
+        )
+
+    if hasattr(hf_layer.attention, "layernorm"):
+        assert torch.allclose(
+            hf_layer.attention.layernorm.weight, smp_layer.attention.layernorm.weight, atol=atol
+        )
+        assert torch.allclose(
+            hf_layer.attention.layernorm.bias, smp_layer.attention.layernorm.bias, atol=atol
+        )
+
+    if hasattr(hf_layer.attention, "pre_layernorm") and hf_layer.attention.pre_layernorm:
+        assert torch.allclose(
+            hf_layer.attention.pre_layernorm.weight,
+            smp_layer.attention.pre_layernorm.weight,
+            atol=atol,
+        )
+        assert torch.allclose(
+            hf_layer.attention.pre_layernorm.bias, smp_layer.attention.pre_layernorm.bias, atol=atol
+        )
+
+
+def compare_embedding_weights(hf_module, smp_module, args, atol=1e-2):
+
+    assert torch.allclose(
+        hf_module.word_embedding.weight, smp_module.word_embedding.weight, atol=atol
+    )
+
+    if args.model_type == "gpt2":
+        assert torch.allclose(
+            hf_module.position_embedding.weight, smp_module.position_embedding.weight, atol=atol
+        )
 
 
 def main():
@@ -215,11 +308,11 @@ def main():
     torch.cuda.set_device(smp.local_rank())
     batch_size = args.train_batch_size
     seq_length = args.max_context_width
-    if args.model_type == "gpt2":
+    if args.model_type in ["gpt2", "gptneo"]:
         vocab_size = 50257
     else:
         vocab_size = 50400
-    
+
     config = TransformerLMHeadConfig(
         num_layers=args.num_layers,
         num_attention_heads=args.num_heads,
@@ -235,7 +328,7 @@ def main():
     )
 
     set_seed(args.seed)
-    lm_head = TransformerLMHead(config).to(torch.device("cuda"))
+
     input_ids = torch.randint(0, 10, (batch_size, seq_length)).to(
         torch.device("cuda", smp.local_rank())
     )
@@ -243,16 +336,11 @@ def main():
     attention_mask = torch.randint(0, 20, (batch_size, seq_length)).to(
         torch.device("cuda", smp.local_rank())
     )
-    inputs = input_ids, attention_mask, None, None, input_ids
-    local_output = lm_head(inputs)
-    nosmp_logits = local_output[1].cpu()
-    local_output[0].backward()
 
     if args.model_type == "gpt2":
         model_config = GPT2Config(
             vocab_size=config.vocab_size,
             n_positions=config.num_positions,
-            n_ctx=config.num_positions,
             n_embd=config.hidden_size,
             n_layer=config.num_layers,
             n_head=config.num_attention_heads,
@@ -268,8 +356,6 @@ def main():
             summary_activation=None,
             summary_proj_to_labels=True,
             summary_first_dropout=0,
-            # gradient_checkpointing=args.gradient_checkpointing > 0,
-            use_cache=True,
             bos_token_id=50256,
             eos_token_id=50256,
             return_dict=True,
@@ -293,117 +379,217 @@ def main():
             eos_token_id=50256,
             return_dict=True,
         )
+    elif args.model_type == "gptneo":
+        model_config = GPTNeoConfig(
+            vocab_size=config.vocab_size,
+            max_position_embeddings=config.num_positions,
+            hidden_size=config.hidden_size,
+            num_layers=config.num_layers,
+            attention_types=[[["global", "local"], int(config.num_layers / 2)]],
+            num_heads=config.num_attention_heads,
+            intermediate_size=None,
+            activation_function="gelu_new",
+            resid_dropout=config.hidden_dropout_prob,
+            embed_dropout=0,
+            attention_dropout_prob=config.attention_dropout_prob,
+            layer_norm_epsilon=1e-05,
+            initializer_range=0.02,
+            bos_token_id=50256,
+            eos_token_id=50256,
+            return_dict=True,
+        )
     else:
         print("model_type can be gpt2 or gptj.")
 
-    torch.set_default_dtype(torch.float16)
+    LOGIT_ATOL = 1e-2
+    WEIGHT_ATOL = 1e-2
+
+    hf_model = AutoModelForCausalLM.from_config(model_config)
+    hf_optimizer = torch.optim.SGD(hf_model.parameters(), lr=1.0)
+    hf_model.cuda()
+    hf_output = hf_model(input_ids=input_ids, attention_mask=attention_mask, labels=input_ids)
+    hf_logits = hf_output.logits[..., :-1, :].contiguous()
+    hf_logits.cuda()
+    hf_loss = hf_output.loss
+    hf_loss.backward()
 
     # disabling fused_bias_gelu because it seems to introduce precision errors in outputs
-    with smp.tensor_parallelism(enabled=smp.tp_size() > 1, fused_bias_gelu=False):
-        model = AutoModelForCausalLM.from_config(model_config)
-    torch.set_default_dtype(torch.float32)
+    with smp.tensor_parallelism(
+        enabled=smp.tp_size() > 1,
+        fused_bias_gelu=False,
+        distribute_embedding=(args.distribute_embedding > 0),
+    ):
+        smp_model = AutoModelForCausalLM.from_config(model_config)
 
-    per_tp_rank_bs = batch_size // smp.tp_size()
+    smp_model = smp.DistributedModel(smp_model, trace_device="gpu", gradient_as_bucket_view=True)
+    if args.model_type == "gpt2":
+        smp_model.load_state_dict(
+            translate_hf_state_dict_to_smdistributed_gpt2(
+                hf_model.state_dict(), args.max_context_width
+            ),
+            strict=True,
+        )
+    elif args.model_type == "gptneo":
+        smp_model.load_state_dict(
+            translate_hf_state_dict_to_smdistributed_gptneo(
+                hf_model.state_dict(), args.max_context_width
+            ),
+            strict=True,
+        )
+    elif args.model_type == "gptj":
+        smp_model.load_state_dict(
+            translate_hf_state_dict_to_smdistributed_gptj(
+                hf_model.state_dict(), args.max_context_width
+            ),
+            strict=True,
+        )
 
-    model = FP16_Module(model)
-    model = smp.DistributedModel(model, trace_device="gpu", gradient_as_bucket_view=True)
     if args.activation_checkpointing:
         smp.set_activation_checkpointing(
-            model.module.module.module.transformer.seq_layers,
-            pack_args_as_tuple=True,
-            strategy=args.activation_strategy,
+            smp_model.module.module.transformer.seq_layers, strategy=args.activation_strategy
         )
-    mod_weight_mapping = map_and_match_mod_weights(lm_head, model, args)
 
-    set_seed(args.seed)
+    smp_optimizer = torch.optim.SGD(smp_model.parameters(), lr=1.0)
+    smp_optimizer = smp.DistributedOptimizer(smp_optimizer)
+    loss_mb, logits_mb = train_step(smp_model, input_ids, attention_mask)
 
-    loss_mb, logits_mb = train_step(model, input_ids, attention_mask)
     logits = torch.cat(tuple(logits_mb.outputs), dim=1)
     logits_gathered = smp.allgather(logits, group=smp.TP_GROUP)
-    smp_logits = torch.cat([t.transpose(0, 1).cpu() for t in logits_gathered], 1)
 
-    # compare logits prescaled vs non-smp
-    tp_rank_nosmp_logits = nosmp_logits[
-        smp.tp_rank() * per_tp_rank_bs : (smp.tp_rank() + 1) * per_tp_rank_bs
-    ][:, :-1, :]
-    tp_rank_smp_logits = smp_logits[
-        smp.tp_rank() * per_tp_rank_bs : (smp.tp_rank() + 1) * per_tp_rank_bs
-    ]
+    dist_emb = args.distribute_embedding > 0
+    if dist_emb:
+        smp_logits = torch.cat([t.cpu() for t in logits_gathered], 2)
+    else:
+        smp_logits = torch.cat([t.transpose(0, 1).cpu() for t in logits_gathered], 1)
 
-    # logits atol is pretty high likely because logits are large, of the scale e+02 or e+03
-    ACTIVATION_ATOL = 2 * 1e-1
-    GRAD_ATOL = 1e-2
+    assert torch.allclose(hf_logits, smp_logits.cuda(), atol=LOGIT_ATOL)
+    print(smp.rank(), "Logits with prescaled batch SMP run match HF run")
 
-    assert torch.allclose(tp_rank_nosmp_logits, tp_rank_smp_logits, atol=ACTIVATION_ATOL), (
-        smp.tp_rank(),
-        tp_rank_nosmp_logits.shape,
-        tp_rank_smp_logits.shape,
-        tp_rank_nosmp_logits[0][0],
-        tp_rank_smp_logits[0][0],
+    # Get smp_model logits after weight update
+    smp.reset()
+    smp.init(smp_config)
+    torch.cuda.set_device(smp.local_rank())
+    with smp.tensor_parallelism(
+        enabled=smp.tp_size() > 1,
+        fused_bias_gelu=False,
+        distribute_embedding=(args.distribute_embedding > 0),
+    ):
+        smp_hf_state_loaded = AutoModelForCausalLM.from_config(model_config)
+    smp_hf_state_loaded = smp.DistributedModel(
+        smp_hf_state_loaded, trace_device="gpu", gradient_as_bucket_view=True
     )
-    print(smp.rank(), "Logits with prescaled batch SMP run match non-SMP run")
+    if args.model_type == "gpt2":
+        smp_hf_state_loaded.load_state_dict(
+            translate_hf_state_dict_to_smdistributed_gpt2(
+                hf_model.state_dict(), args.max_context_width
+            ),
+            strict=True,
+        )
+    elif args.model_type == "gptneo":
+        smp_hf_state_loaded.load_state_dict(
+            translate_hf_state_dict_to_smdistributed_gptneo(
+                hf_model.state_dict(), args.max_context_width
+            ),
+            strict=True,
+        )
+    elif args.model_type == "gptj":
+        smp_hf_state_loaded.load_state_dict(
+            translate_hf_state_dict_to_smdistributed_gptj(
+                hf_model.state_dict(), args.max_context_width
+            ),
+            strict=True,
+        )
+    loss_mb_updated, logits_mb_updated = train_step(smp_hf_state_loaded, input_ids, attention_mask)
+    logits_updated = torch.cat(tuple(logits_mb_updated.outputs), dim=1)
+    logits_gathered_updated = smp.allgather(logits_updated, group=smp.TP_GROUP)
+    # smp_logits_updated = torch.cat([t.transpose(0, 1).cpu() for t in logits_gathered_updated], 1)
+    if dist_emb:
+        smp_logits_updated = torch.cat([t.cpu() for t in logits_gathered_updated], 2)
+    else:
+        smp_logits_updated = torch.cat(
+            [t.transpose(0, 1).cpu() for t in logits_gathered_updated], 1
+        )
 
-    # compare grads prescaled vs non-smp
-    for i, (mod, dist_mod, partition) in enumerate(mod_weight_mapping):
-        if smp.state.module_manager.get_partition(dist_mod) == smp.pp_rank():
-            slice_and_compare_grads(mod, dist_mod, partition=partition, atol=GRAD_ATOL)
-    print(smp.rank(), "Grads with prescaled batch SMP run match non-SMP run")
+    # compare weights SMP vs HF
+    for idx in range(args.num_layers):
+        smp_hf_state_loaded_layer = getattr(
+            smp_hf_state_loaded.module.module.transformer.seq_layers, f"{idx}"
+        )
+        smp_layer = getattr(smp_model.module.module.transformer.seq_layers, f"{idx}")
+        if smp_hf_state_loaded_layer in set(smp_hf_state_loaded.local_modules()):
+            compare_weights(smp_hf_state_loaded_layer.cuda(), smp_layer.cuda(), atol=WEIGHT_ATOL)
+    print(smp.rank(), "Weights with prescaled batch SMP run match HF run")
+
+    if smp_hf_state_loaded.module.module.word_embedding in set(smp_hf_state_loaded.local_modules()):
+        compare_embedding_weights(
+            smp_hf_state_loaded.module.module.cuda(),
+            smp_model.module.module.cuda(),
+            args,
+            atol=WEIGHT_ATOL,
+        )
+
+    print(smp.rank(), "Embedding weights with prescaled batch SMP run match HF run")
 
     # --------
     # run without prescaled
     # -----
+
     if args.run_with_non_prescaled > 0:
         if args.offload_activations > 0:
             # reset internal state of offloader
             smp.state.offloaders.clear()
 
-        # clone and zero grads
-        prescaled_grads = {}
-        for n, p in model.named_parameters():
-            if p.grad is not None:
-                prescaled_grads[n] = p.grad.detach()
-                p.grad = None
+        per_tp_rank_bs = batch_size // smp.tp_size()
 
         input_ids = input_ids.narrow(0, per_tp_rank_bs * smp.tp_rank(), per_tp_rank_bs)
         attention_mask = attention_mask.narrow(0, per_tp_rank_bs * smp.tp_rank(), per_tp_rank_bs)
-        smp.state.cfg.prescaled_batch = False
-        loss_mb_nop, logits_mb_nop = train_step(model, input_ids, attention_mask)
+        smp.core.cfg.prescaled_batch = False
+        if isinstance(
+            smp_hf_state_loaded.module.module.word_embedding, smp.nn.DistributedEmbedding
+        ):
+            smp_hf_state_loaded.module.module.word_embedding._skip_allgather = False
+            smp_hf_state_loaded.module.module.word_embedding._output_full_batch = False
+
+        loss_mb_nop, logits_mb_nop = train_step(smp_hf_state_loaded, input_ids, attention_mask)
         logits_nop = torch.cat(tuple(logits_mb_nop.outputs), dim=1)
-        smp_logits_nop = logits_nop.cpu()
-
-        tp_rank_nosmp_logits = nosmp_logits[
-            smp.tp_rank() * per_tp_rank_bs : (smp.tp_rank() + 1) * per_tp_rank_bs
-        ]
-
-        # compare logits of non-prescaled vs non-smp
-        assert torch.allclose(smp_logits_nop, tp_rank_nosmp_logits, atol=ACTIVATION_ATOL), (
-            smp_logits_nop,
-            tp_rank_nosmp_logits,
-        )
 
         # compare logits of non-prescaled vs prescaled
-        assert torch.allclose(smp_logits_nop[:, :-1, :], tp_rank_smp_logits, atol=1e-3)
+        if dist_emb:
+            logits_nop_gathered = smp.allgather(logits_nop, group=smp.TP_GROUP)
+            smp_logits_nop = torch.cat([t.cpu() for t in logits_nop_gathered], 2)
+            assert torch.allclose(smp_logits_nop.cuda(), smp_logits_updated.cuda(), atol=LOGIT_ATOL)
+        else:
+            smp_logits_nop = logits_nop[:, :-1, :]
+            tp_rank_smp_logits = smp_logits_updated[
+                smp.tp_rank() * per_tp_rank_bs : (smp.tp_rank() + 1) * per_tp_rank_bs
+            ]
+            assert torch.allclose(smp_logits_nop.cuda(), tp_rank_smp_logits.cuda(), atol=LOGIT_ATOL)
+
+        print(smp.rank(), "Logits with non-prescaled batch SMP run match prescaled batch SMP run")
+
+        # smp_hf_state_loaded runs with non-prescaled batch
+        for idx in range(args.num_layers):
+            smp_nop_layer = getattr(
+                smp_hf_state_loaded.module.module.transformer.seq_layers, f"{idx}"
+            )
+            smp_layer = getattr(smp_model.module.module.transformer.seq_layers, f"{idx}")
+            if smp_nop_layer in set(smp_hf_state_loaded.local_modules()):
+                compare_weights(smp_nop_layer.cuda(), smp_layer.cuda(), atol=WEIGHT_ATOL)
+        print(smp.rank(), "Weights with non-prescaled batch SMP run match prescaled batch SMP run")
+
+        if smp_hf_state_loaded.module.module.word_embedding in set(
+            smp_hf_state_loaded.local_modules()
+        ):
+            compare_embedding_weights(
+                smp_hf_state_loaded.module.module.cuda(),
+                smp_model.module.module.cuda(),
+                args,
+                atol=WEIGHT_ATOL,
+            )
 
         print(
             smp.rank(),
-            "Logits with non-prescaled batch SMP run match non-SMP run and prescaled batch SMP run",
-        )
-
-        # compare grads smp non-prescaled vs non-smp
-        for i, (mod, dist_mod, partition) in enumerate(mod_weight_mapping):
-            if smp.state.module_manager.get_partition(dist_mod) == smp.pp_rank():
-                slice_and_compare_grads(mod, dist_mod, partition=partition, atol=GRAD_ATOL)
-
-        # compare grads prescaled vs non-prescaled
-        for n, p in model.named_parameters():
-            if n in prescaled_grads:
-                assert torch.allclose(p.grad, prescaled_grads[n])
-            else:
-                assert p.grad is None
-
-        print(
-            smp.rank(),
-            "Grads with non-prescaled batch SMP run match non-SMP run and prescaled batch SMP run",
+            "Embedding weights with  non-prescaled batch SMP run match prescaled batch SMP run",
         )
 
 

@@ -48,6 +48,7 @@ if smp.rank() == 0:
             enable_grads=True,
         )
         comm.send(msg, [1])
+        time.sleep(0.1)
 else:
     ct = 0
     while True:

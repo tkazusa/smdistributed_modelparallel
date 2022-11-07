@@ -8,6 +8,14 @@ import torch.nn as nn
 
 # First Party
 from smdistributed.modelparallel.backend.logger import get_log_level, get_logger
+from smdistributed.modelparallel.torch.exceptions import (
+    ChildNodeExistingError,
+    CostListError,
+    MemoryWeightError,
+    ModelTooSmallError,
+    ParentNodeExistingError,
+    SMPRuntimeError,
+)
 from smdistributed.modelparallel.torch.utils import dtype_size, product
 
 logger = get_logger()
@@ -36,7 +44,8 @@ class TreeIterator:
             raise StopIteration
 
     def _get_subtree_partitions(self, node):
-        assert self.partition is not None
+        if self.partition is None:
+            raise SMPRuntimeError("partition should not be None")
 
         subtree_partitions = {self.partition[node]}
         for c in node.children:
@@ -70,10 +79,10 @@ class ModuleNode:
 
     def add_child(self, node):
         if node.parent != None:
-            raise ValueError(f"Node {node.module} already has parent {node.parent.module}.")
+            raise ParentNodeExistingError(node.module, node.parent.module)
 
         if node.id in [child.id for child in node.children]:
-            raise ValueError(f"Child {node.module} already exists.")
+            raise ChildNodeExistingError(node.module)
 
         self._children.append(node)
         node.parent = self
@@ -143,7 +152,7 @@ class ModuleNode:
     def iterate_subtree(self, partition=None):
         return TreeIterator(self, partition)
 
-    def maybe_print_tree(self, max_level=5, level=0):
+    def maybe_print_tree(self, max_level=5, level=0):  # pragma: no cover
         from smdistributed.modelparallel.torch.state_mod import state
 
         if get_log_level() == logging.DEBUG:
@@ -201,7 +210,7 @@ class ModulePartitioner:
         """
 
         if memory_weight < 0.0 or memory_weight > 1.0:
-            raise ValueError("Memory weight must between 0.0 and 1.0.")
+            raise MemoryWeightError
 
         self.top_module = module
         self.num_partitions = num_partitions
@@ -260,7 +269,7 @@ class ModulePartitioner:
 
         return module_partition
 
-    def display_partition(self, node_partition):
+    def display_partition(self, node_partition):  # pragma: no cover
         """ Log the module assignments """
         from smdistributed.modelparallel.torch.state_mod import state
 
@@ -760,7 +769,8 @@ class ModulePartitioner:
         if splittable_counts[seg_ptr] < len(segment_partitions[seg_ptr]):
             # this has to be true since the removed dummy will have splittable count = 1,
             # and splittable counts are additive
-            assert splittable_counts[seg_ptr] == len(segment_partitions[seg_ptr]) - 1
+            if splittable_counts[seg_ptr] != len(segment_partitions[seg_ptr]) - 1:
+                raise SMPRuntimeError
 
             # remove the parent since the only reason it was assigned here was the dummy node
             segment_partitions[seg_ptr].pop(0)
@@ -785,7 +795,7 @@ class ModulePartitioner:
         on communication. https://en.wikipedia.org/wiki/D%27Hondt_method """
 
         if len(partitions) < len(cost_list):
-            raise ValueError("Cost list cannot be larger than the number of partitions.")
+            raise CostListError
 
         allocated_partitions = [[] for _ in range(len(cost_list))]
         current_allocations = [0 for _ in range(len(cost_list))]
@@ -803,9 +813,7 @@ class ModulePartitioner:
                     current_allocations[ind] += 1
                     break
             else:
-                raise ValueError(
-                    f"Model is too small to split into {self.num_partitions} partitions!"
-                )
+                raise ModelTooSmallError(self.num_partitions)
 
         # if the parent is not assigned to its pre-determined segment, swap it
         if (

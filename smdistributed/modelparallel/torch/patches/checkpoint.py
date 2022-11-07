@@ -2,6 +2,7 @@
 # Standard Library
 import collections
 import warnings
+from functools import lru_cache
 from typing import Dict, Set, Tuple, Union
 
 import torch
@@ -15,8 +16,12 @@ from torch.utils.checkpoint import (
 
 # First Party
 from smdistributed.modelparallel.backend.logger import get_logger
+from smdistributed.modelparallel.torch.exceptions import (
+    CheckpointingError,
+    InvalidReturnTypeFromCheckpointedModuleError,
+)
 from smdistributed.modelparallel.torch.graph_utils import get_ancestors
-from smdistributed.modelparallel.torch.utils import rmsg
+from smdistributed.modelparallel.torch.utils import map_structure, rmsg
 
 logger = get_logger()
 
@@ -54,17 +59,9 @@ class CheckpointNodesCache:
 
 
 class CheckpointConfig:
-    def __init__(
-        self,
-        enabled=False,
-        preserve_rng_state=True,
-        pack_args_as_tuple=False,
-        module_name=None,
-        strategy="each",
-    ):
+    def __init__(self, enabled=False, preserve_rng_state=True, module_name=None, strategy="each"):
         self.enabled = enabled
         self.preserve_rng_state = preserve_rng_state
-        self.pack_args_as_tuple = pack_args_as_tuple
         self.module_name = module_name
         self.strategy = strategy
 
@@ -77,14 +74,12 @@ class CheckpointConfig:
         self.enabled = False
         self.module_name = None
         self.preserve_rng_state = True
-        self.pack_args_as_tuple = False
         self.strategy = "each"
 
     def __hash__(self):
         return (
             hash(self.enabled)
             + hash(self.preserve_rng_state)
-            + hash(self.pack_args_as_tuple)
             + hash(self.module_name)
             + hash(self.strategy)
         )
@@ -93,7 +88,6 @@ class CheckpointConfig:
         return (
             self.enabled == other.enabled
             and self.preserve_rng_state == other.preserve_rng_state
-            and self.pack_args_as_tuple == other.pack_args_as_tuple
             and self.module_name == other.module_name
             and self.strategy == other.strategy
         )
@@ -103,8 +97,6 @@ class CheckpointConfig:
             options = ""
             if self.preserve_rng_state:
                 options += f"preserve_rng_state,"
-            if self.pack_args_as_tuple:
-                options += f"pack_args_as_tuple,"
             if self.strategy:
                 options += f"strategy: {self.strategy}"
 
@@ -116,12 +108,7 @@ class CheckpointConfig:
 class CheckpointTupledFunction(torch.autograd.Function):
     """
     This is similar to the checkpoint function in torch.utils.checkpoint with a couple of changes.
-    1. It takes an additional bool to determine whether to pass the input args as a packed tuple or not. This
-    is helpful when checkpointing sequential functions which only take single argument and can be a tuple.
-    If pack_args_as_tuple is set to True, it expects tuple to passed as unpacked when passing to the autograd fn,
-    but packs it to tuple when passing to run_function. If the args aren't unpacked when passing to autograd function,
-    the backward graph is broken. Autograd fn only looks at top level tensors.
-
+    1. It supports arbitary Python structures as arguments, as well as keyword arguments and variable-length arguments
     2. It restores execution stack during backward so we can execute fwd pass there.
     3. Instead of executing forward pass in no_grad context, this function runs the forward pass with enable_grad context
      and detaches the outputs after collecting information about ancestors for backward pass bookkeeping and overlapping allreduce.
@@ -130,21 +117,16 @@ class CheckpointTupledFunction(torch.autograd.Function):
 
     @staticmethod
     def forward(
-        ctx,
-        run_function,
-        preserve_rng_state,
-        pack_args_as_tuple,
-        shard_activation_offloading,
-        *args,
+        ctx, run_function, preserve_rng_state, shard_activation_offloading, wrapping_obj, *args
     ):
         from smdistributed.modelparallel.torch.state_mod import state
 
         check_backward_validity(args)
         ctx.run_function = run_function
         ctx.preserve_rng_state = preserve_rng_state
-        ctx.pack_args_as_tuple = pack_args_as_tuple
         ctx.shard_activation_offloading = shard_activation_offloading
         ctx.seed = state.rng_manager.get_state()
+        ctx.wrapping_obj = wrapping_obj
         if preserve_rng_state:
             ctx.fwd_cpu_state = torch.get_rng_state()
             # Don't eagerly initialize the cuda context by accident.
@@ -166,11 +148,12 @@ class CheckpointTupledFunction(torch.autograd.Function):
         ctx.exec_stack = state.module_manager.execution_stack
 
         with torch.enable_grad():
-            # dont unpack here so layer gets tuple
-            if pack_args_as_tuple:
-                outputs = run_function(args)
-            else:
-                outputs = run_function(*args)
+            _args, kwargs = state.serialization_manager.deserialize(wrapping_obj, args)
+            outputs = run_function(*_args, **kwargs)
+            if isinstance(outputs, (dict, set)):
+                raise InvalidReturnTypeFromCheckpointedModuleError(
+                    "The return value from the forward method of a checkpointed module cannot be of type dict or set."
+                )
 
         if state.model:
             # there can't be another checkpoint within this fwd pass subgraph so dont need to pass
@@ -180,26 +163,26 @@ class CheckpointTupledFunction(torch.autograd.Function):
             state.checkpoint_nodes_cache.add(ctx, params, input_nodes, parent_recv_nodes)
             logger.debug(rmsg(f"{len(params)} params are reachable from output of checkpointed fn"))
 
-            state.model.grad_counter.increment_expected_num_grads(
-                state.microbatch, [state.model.get_param_name(p) for p in params]
-            )
+            if not state.cfg.zero2d_enabled():
+                state.model.grad_counter.increment_expected_num_grads(
+                    state.microbatch, [state.model.get_param_name(p) for p in params]
+                )
 
-        if torch.is_tensor(outputs):
-            outputs = (outputs,)
+        def _detach(x):
+            if isinstance(x, torch.Tensor):
+                out = x.detach()
+                out.requires_grad = x.requires_grad
+                return out
+            return x
 
-        outputs = detach_variable(outputs)
-
-        if len(outputs) == 1:
-            outputs = outputs[0]
-
-        return outputs
+        return map_structure(_detach, outputs)
 
     @staticmethod
     def backward(ctx, *args):
         from smdistributed.modelparallel.torch.state_mod import state
 
         if not torch.autograd._is_checkpoint_valid():
-            raise RuntimeError(
+            raise CheckpointingError(
                 "Checkpointing is not compatible with .grad(), "
                 "please use .backward() if possible"
             )
@@ -227,39 +210,47 @@ class CheckpointTupledFunction(torch.autograd.Function):
                         set_device_states(ctx.fwd_gpu_devices, ctx.fwd_gpu_states)
 
                 # Compute the forward pass.
-                detached_inputs = detach_variable(inputs)
+                detached_inputs = detach_variable(tuple(inputs))
                 state.module_manager.execution_stack = ctx.exec_stack
 
                 # we dont need to disable backward counting here
                 # as this backward will be only within a single partition
                 # this checkpoint function is assumed to be for a module within a single partition
                 with state.rerunning_fwd_on_checkpointed_fn(), torch.enable_grad():
-                    if ctx.pack_args_as_tuple:
-                        outputs = ctx.run_function(detached_inputs)
-                    else:
-                        outputs = ctx.run_function(*detached_inputs)
+                    _args, kwargs = state.serialization_manager.deserialize(
+                        ctx.wrapping_obj, detached_inputs
+                    )
+                    outputs = ctx.run_function(*_args, **kwargs)
 
-            if isinstance(outputs, torch.Tensor):
-                outputs = (outputs,)
+            _, output_list = state.serialization_manager.serialize(outputs, for_transmission=False)
 
             filtered_outps = []
             filtered_args = []
-            for i in range(len(outputs)):
-                if outputs[i].requires_grad:
-                    filtered_outps.append(outputs[i])
-                    filtered_args.append(args[i])
+            ct = 0
+            for i in range(len(output_list)):
+                if output_list[i].requires_grad:
+                    filtered_outps.append(output_list[i])
+                    if ct == len(args):
+                        raise InvalidReturnTypeFromCheckpointedModuleError(
+                            "No gradient received for one of the outputs of a checkpointed module that require grad. A common cause for this is that one of the output tensors is an ancestor of another. If you are using HuggingFace transformers, try setting use_cache=False, and avoid returning internal tensors from checkpointed modules."
+                        )
+
+                    filtered_args.append(args[ct])
+                    ct += 1
 
             torch.autograd.backward(tuple(filtered_outps), tuple(filtered_args))
             grads = tuple(
-                inp.grad if isinstance(inp, torch.Tensor) else inp for inp in detached_inputs
+                inp.grad if isinstance(inp, torch.Tensor) else None for inp in detached_inputs
             )
         return (None, None, None, None) + grads
 
 
+@lru_cache(maxsize=2048)
 def validate_checkpointable(module):
     from smdistributed.modelparallel.torch.state_mod import state
 
-    assert isinstance(module, nn.Module), f"{module} is not a Module"
+    if not isinstance(module, nn.Module):
+        raise CheckpointingError(f"{module} is not a Module")
     if state.model:
         # Check if all sub-modules are in the same partition
         if not state.module_manager.check_module_partition(module):
@@ -273,16 +264,17 @@ def validate_checkpointable(module):
                 warnings.warn(message)
                 return False
             else:
-                raise AssertionError(message)
+                raise CheckpointingError(message)
     return True
 
 
 def validate_checkpointable_sequential(sequential_module):
     from smdistributed.modelparallel.torch.state_mod import state
 
-    assert isinstance(
-        sequential_module, nn.Sequential
-    ), f"`checkpoint_sequential` can only be used with nn.Sequential modules. Passed module is of type {type(sequential_module)}."
+    if not isinstance(sequential_module, nn.Sequential):
+        raise CheckpointingError(
+            f"`checkpoint_sequential` can only be used with nn.Sequential modules. Passed module is of type {type(sequential_module)}."
+        )
     if state.model:
         # Check if children of the sub-modules are in the same partition
         for module in sequential_module.children():
@@ -299,34 +291,32 @@ def validate_checkpointable_sequential(sequential_module):
                     warnings.warn(message)
                     return False
                 else:
-                    raise AssertionError(message)
+                    raise CheckpointingError(message)
     return True
 
 
-def checkpoint_function(
-    fn, *args, module_name, preserve_rng_state=True, pack_args_as_tuple=False, strategy="each"
-):
+def checkpoint_function(fn, args, kwargs, module_name, preserve_rng_state=True, strategy="each"):
     from smdistributed.modelparallel.torch.state_mod import state
 
     with state.enable_activation_checkpoints(
         CheckpointConfig(
             enabled=True,
             preserve_rng_state=preserve_rng_state,
-            pack_args_as_tuple=pack_args_as_tuple,
             strategy=strategy,
             module_name=module_name,
         )
     ):
-        return fn(*args)
+        return fn(*args, **kwargs)
 
 
-def checkpoint(module, *args, preserve_rng_state=True):
+def checkpoint(module, *args, preserve_rng_state=True, **kwargs):
     from smdistributed.modelparallel.torch.state_mod import state
 
     if not state.is_tracing() and validate_checkpointable(module):
         return checkpoint_function(
             module.forward,
-            *args,
+            args,
+            kwargs,
             module_name=state.module_manager.get_module_name(module),
             preserve_rng_state=preserve_rng_state,
         )
@@ -343,14 +333,19 @@ def checkpoint_sequential(
 ):
     from smdistributed.modelparallel.torch.state_mod import state
 
+    if pack_args_as_tuple:
+        logger.warning(
+            "pack_args_as_tuple argument is deprecated, and will be removed in a future version of smp. This argument is a no-op and is not required."
+        )
+
     if validate_checkpointable_sequential(sequential_module):
         return checkpoint_function(
             sequential_module.forward,
-            input,
+            (input,),
+            {},
             module_name=state.module_manager.get_module_name(sequential_module),
             strategy=strategy,
             preserve_rng_state=preserve_rng_state,
-            pack_args_as_tuple=pack_args_as_tuple,
         )
         # else:
         #     return checkpoint_function(
@@ -359,7 +354,6 @@ def checkpoint_sequential(
         #         module_name=state.module_manager.get_module_name(sequential_module),
         #         strategy=strategy,
         #         preserve_rng_state=preserve_rng_state,
-        #         pack_args_as_tuple=pack_args_as_tuple,
         #     )
     else:
         sequential_module.forward(*input)

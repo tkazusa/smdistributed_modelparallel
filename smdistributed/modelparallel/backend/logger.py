@@ -4,6 +4,9 @@ import os
 import sys
 from functools import lru_cache
 
+# First Party
+from smdistributed.modelparallel.backend.exceptions import LoggingConfigError
+
 _logger_initialized = False
 _log_level = None
 
@@ -57,7 +60,9 @@ class NoParsingFilter(logging.Filter):
     def __init__(self, blocklist, allowlist):
         super(NoParsingFilter, self).__init__()
         if len(allowlist) and len(blocklist):
-            raise ValueError("Only one of SMP_LOG_ALLOW_FILES or SMP_LOG_BLOCK_FILES can be set.")
+            raise LoggingConfigError(
+                "Only one of SMP_LOG_ALLOW_FILES or SMP_LOG_BLOCK_FILES can be set."
+            )
         self.blocklist = blocklist
         self.allowlist = allowlist
 

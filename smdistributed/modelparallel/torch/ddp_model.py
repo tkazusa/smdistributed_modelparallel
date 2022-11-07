@@ -15,6 +15,11 @@ from smdistributed.modelparallel.backend.logger import get_logger
 from smdistributed.modelparallel.torch import smplib
 from smdistributed.modelparallel.torch.allreduce.ddp import DdpNonOverlappingAllreducer
 from smdistributed.modelparallel.torch.core import core, dp_size, local_rank, rdp_size, tp_size
+from smdistributed.modelparallel.torch.exceptions import (
+    SMPUnsupportedError,
+    UnsupportedReducerTypeError,
+    UnsupportedTorchVersionError,
+)
 from smdistributed.modelparallel.torch.state_mod import state
 from smdistributed.modelparallel.torch.utils import check_env_var_truthy, rmsg
 
@@ -79,24 +84,25 @@ class DistributedDataParallel(OriginalDistributedDataParallel):
         self.bucket_bytes_cap = int(bucket_cap_mb * 1024 * 1024)
         self.gradient_as_bucket_view = gradient_as_bucket_view
         self.bucket_rebuild_enabled = not check_env_var_truthy("SMP_DISABLE_BUCKET_REBUILD", "0")
+        self._use_replicated_tensor_module = False
         if _pt_110_or_newer:
             pass
-        elif _pt_19_or_newer:
+        elif _pt_19_or_newer:  # pragma: no cover
             self.ddp_uneven_inputs_config = _DDPUnevenInputsConfig(
                 ddp_join_enabled=False,
                 ddp_join_divide_by_initial_world_size=False,
                 ddp_join_throw_on_early_termination=False,
             )
-        elif _pt_18_or_newer:
+        elif _pt_18_or_newer:  # pragma: no cover
             self.ddp_uneven_inputs_config = _DDPUnevenInputsConfig(
                 ddp_join_enabled=False, ddp_join_divide_by_initial_world_size=False
             )
-        elif _pt_17_or_newer:
+        elif _pt_17_or_newer:  # pragma: no cover
             self.ddp_join_enabled = False
             self.ddp_join_divide_by_initial_world_size = False
         if _pt_110_or_newer:
             self._passing_sync_batchnorm_handle(self.module)
-        else:
+        else:  # pragma: no cover
             self._passing_sync_batchnorm_handle(self._module_copies)
         if hasattr(self, "_ddp_params_and_buffers_to_ignore"):
             self.parameters_to_ignore = self._ddp_params_and_buffers_to_ignore
@@ -347,7 +353,7 @@ class DistributedDataParallel(OriginalDistributedDataParallel):
             args.append(self.find_unused_parameters)
             args.append(self.gradient_as_bucket_view)
         else:
-            raise RuntimeError("Unsupported Torch version")
+            raise UnsupportedTorchVersionError
         if _pt_19_or_newer:
             args.append(param_map)
         args.extend(
@@ -395,7 +401,7 @@ class DistributedDataParallel(OriginalDistributedDataParallel):
         elif reducer == self.default_reducer:
             return ReducerType.DEFAULT
         else:
-            raise RuntimeError("Unknown reducer type.")
+            raise UnsupportedReducerTypeError(reducer)
 
     def _check_default_group(self):
         with self._reducer_type(ReducerType.DEFAULT):
@@ -546,28 +552,24 @@ class DistributedDataParallel(OriginalDistributedDataParallel):
             smplib._register_comm_hook(reducer, curr_state, hook)
 
     # only in PT 1.8
-    def _register_builtin_comm_hook(self, comm_hook_type):
+    def _register_builtin_comm_hook(self, comm_hook_type):  # pragma: no cover
         if _pt_18_or_newer:
             smplib._register_builtin_comm_hook(self.reducer, comm_hook_type)
         else:
-            raise NotImplementedError(
+            raise SMPUnsupportedError(
                 "_register_builtin_comm_hook is only supported with PyTorch 1.8 or newer"
             )
 
-    def get_ddp_logging_data(self, reducer_type):
+    def get_ddp_logging_data(self, reducer_type):  # pragma: no cover
         if _pt_18_or_newer and not _pt_19_or_newer:
             if reducer_type == "default":
                 return smplib._get_ddp_logging_data(self.default_reducer)
             elif reducer_type == "scaled_batch":
                 return smplib._get_ddp_logging_data(self.scaled_batch_reducer)
             else:
-                raise ValueError(
-                    "reducer type can only be default or scaled_batch, but {} given".format(
-                        reducer_type
-                    )
-                )
+                raise UnsupportedReducerTypeError(reducer_type)
         else:
-            raise NotImplementedError("_get_ddp_logging_data is only supported with PyTorch 1.8")
+            raise SMPUnsupportedError("_get_ddp_logging_data is only supported with PyTorch 1.8")
 
     # ---------------------------------------------
 
@@ -582,30 +584,30 @@ class DistributedDataParallel(OriginalDistributedDataParallel):
     # ---------------------------------------------
     # New methods used only by SMP
     # ------
-    def _get_ddp_join_enabled(self):
+    def _get_ddp_join_enabled(self):  # pragma: no cover
         if _pt_110_or_newer:
             return False
-        elif _pt_18_or_newer :
+        elif _pt_18_or_newer:
             return self.ddp_uneven_inputs_config.ddp_join_enabled
         elif _pt_17_or_newer:
             return self.ddp_join_enabled
         else:
-            raise NotImplementedError
+            raise SMPUnsupportedError
 
-    def _get_ddp_join_divide_by_initial_world_size(self):
+    def _get_ddp_join_divide_by_initial_world_size(self):  # pragma: no cover
         if _pt_18_or_newer and not _pt_110_or_newer:
             return self.ddp_uneven_inputs_config.ddp_join_divide_by_initial_world_size
         elif _pt_17_or_newer:
             return self.ddp_join_divide_by_initial_world_size
         else:
-            raise NotImplementedError
+            raise SMPUnsupportedError
 
     def _pre_ddp_step(self, require_backward_grad_sync):
         self.require_backward_grad_sync = require_backward_grad_sync
         self._maybe_sync_buffers()
 
         if _pt_17_or_newer:
-            if not _pt_110_or_newer and self._get_ddp_join_enabled():
+            if not _pt_110_or_newer and self._get_ddp_join_enabled():  # pragma: no cover
                 ones = [
                     torch.ones(1, device=torch.device("cuda", local_rank()))
                     for _ in self.reducer_types
@@ -632,7 +634,7 @@ class DistributedDataParallel(OriginalDistributedDataParallel):
     # When running in join mode, schedules an allreduce to match the one in the
     # forward pass to determine the no. of currently active processes and whether
     # all processes have joined.
-    def _schedule_shadow_all_reduce_for_fwd_pass(self):
+    def _schedule_shadow_all_reduce_for_fwd_pass(self):  # pragma: no cover
         if len(self.reducer_types) == 0:
             # if there are no reducers (parameters), assume no active processes
             return 0
@@ -650,10 +652,10 @@ class DistributedDataParallel(OriginalDistributedDataParallel):
     if _pt_110_or_newer:
 
         @contextmanager
-        def join(self, *args, **kwargs):
-            raise NotImplementedError("join is currently only supported with PT 1.7-1.9")
+        def join(self, *args, **kwargs):  # pragma: no cover
+            raise SMPUnsupportedError("join is currently only supported with PT 1.7-1.9")
 
-    else:
+    else:  # pragma: no cover
 
         @contextmanager
         def join(
@@ -661,10 +663,12 @@ class DistributedDataParallel(OriginalDistributedDataParallel):
         ):
             """ Taken from ddp join() method, adapted for multi-reducer case."""
             if core.cfg._fp32_grad_accumulation:
-                raise ValueError("join not supported when _fp32_grad_accumulation is enabled")
+                raise SMPUnsupportedError(
+                    "join not supported when _fp32_grad_accumulation is enabled"
+                )
             try:
                 if self.device_ids and len(self.device_ids) > 1:
-                    raise ValueError(
+                    raise SMPUnsupportedError(
                         """DDP join() API does not support Single-Process Multi-GPU
                         mode training. The recommended approach for DDP training is
                         to spawn a single process that works on a single GPU."""
@@ -771,7 +775,7 @@ class DistributedDataParallel(OriginalDistributedDataParallel):
                     self._sync_final_model(is_last_joiner)
 
     # -----
-    def _reset_join_state(self):
+    def _reset_join_state(self):  # pragma: no cover
         if _pt_110_or_newer:
             return
         if _pt_19_or_newer:

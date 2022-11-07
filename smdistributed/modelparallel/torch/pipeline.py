@@ -2,6 +2,9 @@
 from abc import ABCMeta, abstractmethod
 from enum import Enum
 
+# First Party
+from smdistributed.modelparallel.torch.exceptions import SMPUnsupportedError
+
 
 class MbStatus(Enum):
     """
@@ -39,7 +42,7 @@ class PTPipeline:
 
     @abstractmethod
     def get_next_microbatch(self):
-        raise NotImplementedError
+        raise SMPUnsupportedError
 
     def mark_done(self, mb):
         self.status[mb] = MbStatus.DONE

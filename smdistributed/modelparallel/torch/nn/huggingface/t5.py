@@ -3,6 +3,9 @@ try:
 except ImportError:
     hf_transformers_available = False
 
+# First Party
+from smdistributed.modelparallel.torch.exceptions import HFT5ConfigError
+
 if hf_transformers_available:
 
     def hf_t5_transformer_layer_init_hook(config, has_relative_attention_bias=False):
@@ -12,7 +15,7 @@ if hf_transformers_available:
             return None
 
         if config.d_kv * config.num_heads != config.d_model:
-            raise ValueError(
+            raise HFT5ConfigError(
                 f"The product of d_kv ({config.d_kv}) and num_heads ({config.num_heads}) must be equal to d_model ({d_model}) in T5 configuration."
             )
 
@@ -50,12 +53,12 @@ if hf_transformers_available:
             or output_attentions
             or not return_dict
         ):
-            raise ValueError(
+            raise HFT5ConfigError(
                 f"layer_head_mask, encoder_layer_head_mask, past_key_value, use_cache, output_attentions, and return_dict arguments of T5Block are not supported."
             )
 
         if attention_mask is None:
-            raise ValueError(
+            raise HFT5ConfigError(
                 "attention_mask is a required argument of DistributedTransformerLayer."
             )
 

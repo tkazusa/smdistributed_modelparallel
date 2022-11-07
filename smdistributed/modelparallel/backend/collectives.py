@@ -5,6 +5,12 @@ import pickle
 from enum import Enum
 from typing import NamedTuple
 
+# First Party
+from smdistributed.modelparallel.backend.exceptions import (
+    CommGroupConfigError,
+    InvalidTransactionIDError,
+)
+
 
 class CommGroup(Enum):
     WORLD = 0
@@ -88,7 +94,7 @@ class CollectiveCommunicator:
         Returns global rank of sender and the group with which to communicate
         """
         if not isinstance(comm_group, CommGroup):
-            raise ValueError(
+            raise CommGroupConfigError(
                 "`group` is a required argument and has to be one of WORLD, PP_GROUP or DP_GROUP"
             )
 
@@ -139,7 +145,7 @@ class CollectiveCommunicator:
         elif group == CommGroup.RDP_GROUP:
             return self.core.rdp_size()
         else:
-            raise ValueError(f"Unsupported CommGroup type {group}.")
+            raise CommGroupConfigError(f"Unsupported CommGroup type {group}.")
 
     def broadcast(self, obj, group):
         """
@@ -319,7 +325,7 @@ class CollectiveCommunicator:
 
     def _validate_transaction_id(self, transaction_id, server):
         if (transaction_id, server) not in self.tracked_transactions:
-            raise ValueError(f"Invalid transaction ID: {transaction_id}")
+            raise InvalidTransactionIDError(transaction_id)
 
     def _deserialize_object(self, buf, depickle=True):
         s = buf.contents

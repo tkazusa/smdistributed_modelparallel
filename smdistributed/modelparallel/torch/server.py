@@ -8,6 +8,7 @@ import torch
 # First Party
 from smdistributed.modelparallel.backend.logger import get_logger
 from smdistributed.modelparallel.torch.core import pp_rank, rank
+from smdistributed.modelparallel.torch.exceptions import InvalidRequestError, SMPRuntimeError
 from smdistributed.modelparallel.torch.messages import (
     BackwardExecutionResult,
     DummyBackwardResult,
@@ -39,11 +40,6 @@ from smdistributed.modelparallel.torch.server_queue import (
 from smdistributed.modelparallel.torch.state_mod import state
 from smdistributed.modelparallel.torch.utils import rmsg
 from smdistributed.modelparallel.torch.worker import WorkerExecStatus, WorkerHolder
-
-
-class NoSuchRequest(Exception):
-    def __init__(self, req):
-        self.req = req
 
 
 class ExecutionServer:
@@ -93,7 +89,7 @@ class ExecutionServer:
             del self._pending_requests_to_workers[req]
             return worker_id
         except KeyError:
-            raise NoSuchRequest(req)
+            raise InvalidRequestError(req)
 
     def record_pending_request(self, req: ModuleExecutionRequest, worker_id: int = None):
         if worker_id is None:
@@ -129,7 +125,8 @@ class ExecutionServer:
             for x in self._pending_requests_to_workers.keys()
             if isinstance(x, req_type) and x.mb == mb
         ]
-        assert len(matched_reqs) == 1
+        if len(matched_reqs) != 1:
+            raise SMPRuntimeError("matched_reqs must be unique")
         return matched_reqs[0]
 
     def process_wait_backward(self, req: Union[WaitForBackwardRequest, WaitForBackwardDoneRequest]):
@@ -221,7 +218,10 @@ class ExecutionServer:
             if state.module_manager.is_main_module(
                 current_mod
             ) and state.module_manager.is_executor(current_mod):
-                assert pp_rank() == 0
+                if pp_rank() != 0:
+                    raise SMPRuntimeError(
+                        f"main module and executor should have pp rank 0, but get {pp_rank()}"
+                    )
                 req = self._get_pending_wait_for_req(mb, WaitForBackwardDoneRequest)
                 wid = self.pop_pending_request(req)
                 self._workers[wid].resume_backward()
@@ -318,7 +318,7 @@ class ExecutionServer:
         elif isinstance(res, ResumeBackward):
             self._workers[worker_id].resume_backward()
         else:
-            raise NotImplementedError
+            raise SMPUnsupportedError
 
     def run_step_leader(
         self, mb_args: List[Tuple[Any]], mb_kwargs: List[Dict[str, Any]], step_func_id: int
@@ -378,7 +378,7 @@ class ExecutionServer:
                     state.model.post_partition()
                     self.server_queue.set_partitioned()
                 else:
-                    raise NotImplementedError
+                    raise SMPUnsupportedError
             elif state.model.partitioned:
                 mb = task.get_microbatch()
                 if mb is not None:
@@ -406,7 +406,8 @@ class ExecutionServer:
                         state.core.timeline_record_pipeline_event(req.mb, req.__repr__())
                         res = ResumeBackward(req)
                         state.pipeline.promote_status(mb)
-                        state.model.grad_counter.mark_fwd_pass_done(mb)
+                        if not state.cfg.zero2d_enabled():
+                            state.model.grad_counter.mark_fwd_pass_done(mb)
                         worker_id = self.pop_pending_request(req)
                         self.resume_worker(worker_id, res)
                         state.core.timeline_record_pipeline_event(req.mb, req.__repr__())
@@ -439,7 +440,10 @@ class ExecutionServer:
             # Follower has nothing to do if there is no message, hence the block
             task = self.server_queue.get_next_task()
             self.current_task = task
-            assert isinstance(task, IncomingMessageTask)
+            if not isinstance(task, IncomingMessageTask):
+                raise SMPRuntimeError(
+                    f"task should be IncomingMessageTask at step follower, instead getting {type(task)}"
+                )
             r = task.get_message()
             if isinstance(r, ExecutionRequest):
                 state.core.timeline_record_pipeline_event(r.mb, r.__repr__())

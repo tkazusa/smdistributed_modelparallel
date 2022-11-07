@@ -8,6 +8,7 @@ import torch.nn as nn
 from torch.nn import Module
 
 from smdistributed.modelparallel.torch.core import local_rank
+from smdistributed.modelparallel.torch.exceptions import SMPRuntimeError
 from smdistributed.modelparallel.torch.state_mod import state
 from smdistributed.modelparallel.torch.utils import (
     check_requires_grad,
@@ -76,7 +77,8 @@ def trace_forward(self: Module, *args: Any, **kwargs: Any):
     state.module_manager.save_input_size(self, get_size_tensors_in_obj((args, kwargs)))
     state.module_manager.save_output_size(self, get_size_tensors_in_obj(output))
     if state.module_manager.is_main_module(self):
-        assert check_requires_grad(output) is False
+        if check_requires_grad(output):
+            raise SMPRuntimeError("output should not require grad")
         raise TracingEnd()
         # cast to gpu so code outside module can work on it
         # return output.to(torch.device("cuda", local_rank()))

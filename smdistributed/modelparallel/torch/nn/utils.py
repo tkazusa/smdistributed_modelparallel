@@ -13,6 +13,14 @@ from torch.nn import init
 # First Party
 from smdistributed.modelparallel.torch.comm import CommGroup
 from smdistributed.modelparallel.torch.core import local_rank, tp_rank, tp_size
+from smdistributed.modelparallel.torch.exceptions import (
+    InvalidSeqLenPrescaledBatchError,
+    PaddingSizeError,
+    ShiftValueError,
+    SMPInvalidArgumentError,
+    SplitShapeLenError,
+    SplitShapeMismatchError,
+)
 
 
 def cat_cuda_dim0(tensor_list):
@@ -38,9 +46,7 @@ def shard_sequence(*args, shift=0, bwd_allgather=True):
     seq_length = args[0].shape[1]
 
     if seq_length % tp_size() != 0:
-        raise ValueError(
-            "Sequence length must be divisible by the tensor parallelism degree when prescaled_batch is True."
-        )
+        raise InvalidSeqLenPrescaledBatchError
 
     seq_per_tp = seq_length // tp_size()
 
@@ -53,9 +59,7 @@ def shard_sequence(*args, shift=0, bwd_allgather=True):
 
 def unshard_sequence(seq_length, *args):
     if seq_length % tp_size() != 0:
-        raise ValueError(
-            "Sequence length must be divisible by the tensor parallelism degree when prescaled_batch is True."
-        )
+        raise InvalidSeqLenPrescaledBatchError
 
     seq_per_tp = seq_length // tp_size()
     allgathered = [(allgather_for_tp(arg, 0) if arg is not None else None) for arg in args]
@@ -94,16 +98,23 @@ def parse_args(args, kwargs, keys, module_obj=None):
     return parsed_kwargs
 
 
+def _get_inner_tensor(param):
+    if hasattr(param, "ds_tensor"):
+        return param.ds_tensor
+
+    return param.data
+
+
 def override_params_with_normal(module, initializer_range):
     for m in module.modules():
         if isinstance(m, nn.Linear):
-            m.weight.data.normal_(mean=0.0, std=initializer_range)
+            _get_inner_tensor(m.weight).normal_(mean=0.0, std=initializer_range)
             if m.bias is not None:
-                m.bias.data.zero_()
+                _get_inner_tensor(m.bias).zero_()
         elif isinstance(m, nn.Embedding):
-            m.weight.data.normal_(mean=0.0, std=initializer_range)
+            _get_inner_tensor(m.weight).normal_(mean=0.0, std=initializer_range)
             if m.padding_idx is not None:
-                m.weight.data[m.padding_idx].zero_()
+                _get_inner_tensor(m.weight)[m.padding_idx].zero_()
 
 
 @contextmanager
@@ -214,7 +225,8 @@ def _patch_fan_in_and_fan_out(partition, fan_in_scale, fan_out_scale):
     variance is computed as if the whole matrix is being initialized.
     """
 
-    assert partition in [None, "input", "output"]
+    if partition not in [None, "input", "output"]:
+        raise SMPInvalidArgumentError(f"Unsupported partition type {partition}.")
 
     org_fan_in_and_fan_out = init._calculate_fan_in_and_fan_out
 
@@ -228,7 +240,7 @@ def _patch_fan_in_and_fan_out(partition, fan_in_scale, fan_out_scale):
         elif partition == "output":
             return fan_in, tp_size() * fan_out
         else:
-            raise ValueError(f"Unsupported partition type {partition}.")
+            raise SMPInvalidArgumentError(f"Unsupported partition type {partition}.")
 
     init._calculate_fan_in_and_fan_out = adjusted_fan_in_and_fan_out
     yield
@@ -309,6 +321,9 @@ def reduce_scatter_for_tp(tensor, batch_dim, split_shapes=None, shift=0, transpo
 
     from smdistributed.modelparallel.torch.state_mod import state
 
+    if tp_size() == 1:
+        return tensor
+
     if not state.is_tracing():
         return ReduceScatterForTP.apply(tensor, batch_dim, split_shapes, shift, transpose)
     else:
@@ -331,6 +346,9 @@ def fused_allgather_for_tp(tensor, batch_dim, merge_shapes=None):
 
     from smdistributed.modelparallel.torch.state_mod import state
 
+    if tp_size() == 1:
+        return tensor
+
     if not state.is_tracing():
         return FusedAllgatherForTP.apply(tensor, batch_dim, merge_shapes)
     else:
@@ -344,6 +362,9 @@ def narrow_for_tp(tensor, batch_dim, shift=0, bwd_allgather=True):
     """
 
     from smdistributed.modelparallel.torch.state_mod import state
+
+    if tp_size() == 1 and shift == 0:
+        return tensor
 
     if not state.is_tracing():
         return NarrowForTP.apply(tensor, batch_dim, shift, bwd_allgather)
@@ -366,6 +387,9 @@ def allgather_for_tp(tensor, batch_dim, merge_shapes=None):
 
     from smdistributed.modelparallel.torch.state_mod import state
 
+    if tp_size() == 1:
+        return tensor
+
     if not state.is_tracing():
         return AllgatherForTP.apply(tensor, batch_dim, merge_shapes)
     else:
@@ -379,13 +403,16 @@ def scatter_and_merge_for_tp(tensor, split_dim, merge_dim, merge_shapes=None):
 
     from smdistributed.modelparallel.torch.state_mod import state
 
+    if tp_size() == 1:
+        return tensor
+
     if not state.is_tracing():
         return ScatterAndMergeForTP.apply(tensor, split_dim, merge_dim, merge_shapes)
     else:
         return narrow_and_scale_for_tracing(tensor, split_dim, merge_dim)
 
 
-def fwd_allreduce_for_tp(tensor):
+def fwd_allreduce_for_tp(tensor, op=torch.distributed.ReduceOp.SUM):
     """
     Allreduce tensors in forward, no-op in backward. Can be replaced with fused_allgather + reduce_scatter
     combination, when they appear back-to-back, for efficiency.
@@ -393,8 +420,11 @@ def fwd_allreduce_for_tp(tensor):
 
     from smdistributed.modelparallel.torch.state_mod import state
 
+    if tp_size() == 1:
+        return tensor
+
     if not state.is_tracing():
-        return ForwardAllreduceForTP.apply(tensor)
+        return ForwardAllreduceForTP.apply(tensor, op)
     else:
         return tensor
 
@@ -405,6 +435,9 @@ def bwd_allreduce_for_tp(tensor):
     """
 
     from smdistributed.modelparallel.torch.state_mod import state
+
+    if tp_size() == 1:
+        return tensor
 
     if not state.is_tracing():
         return BackwardAllreduceForTP.apply(tensor)
@@ -441,9 +474,7 @@ class NarrowForTP(torch.autograd.Function):
         ctx.bwd_allgather = bwd_allgather
 
         if shift > ctx.split_shapes[tp_rank()]:
-            raise ValueError(
-                f"Shift {shift} must be less than or equal to the local size {ctx.split_shapes[tp_rank()]}."
-            )
+            raise ShiftValueError(shift, ctx.split_shapes[tp_rank()])
 
         if shift < 0:
             ctx.split_shapes[0] += shift
@@ -509,18 +540,18 @@ class FusedAllgatherForTP(torch.autograd.Function):
 class ForwardAllreduceForTP(torch.autograd.Function):
     @staticmethod
     @custom_fwd
-    def forward(ctx, tensor):
+    def forward(ctx, tensor, op):
         from smdistributed.modelparallel.torch.comm import get_tp_process_group
         from smdistributed.modelparallel.torch.state_mod import state
 
         with state.nccl_throttler.throttle():
-            torch.distributed.all_reduce(tensor, group=get_tp_process_group())
+            torch.distributed.all_reduce(tensor, op=op, group=get_tp_process_group())
         return tensor
 
     @staticmethod
     @custom_bwd
     def backward(ctx, grad):
-        return grad
+        return grad, None
 
 
 class BackwardAllreduceForTP(torch.autograd.Function):
@@ -636,9 +667,7 @@ def _maybe_pad_tensor_for_tp_slicing(tensor, pad_size, dim):
     dim = len(tensor.size()) + dim if dim < 0 else dim
     orig_size = tensor.size()[dim]
     if orig_size > pad_size:
-        raise ValueError(
-            f"When padding the tensor, orig_size {orig_size} must be smaller or equal to pad_size {pad_size}"
-        )
+        raise PaddingSizeError(orig_size, pad_size)
 
     if orig_size == pad_size:
         return tensor
@@ -676,11 +705,9 @@ def _reduce_scatter_impl(input_tensor, batch_dim, split_shapes=None, shift=0):
     bs_size = input_tensor.size(batch_dim)
     if split_shapes != None:
         if sum(split_shapes) != bs_size:
-            raise ValueError(f"Dimension size {bs_size} can not be splitted by {split_shapes}")
+            raise SplitShapeMismatchError(bs_size, split_shapes)
         if len(split_shapes) != tp_size():
-            raise ValueError(
-                f"Split shapes {split_shapes} must have same length of tp_size {tp_size()}"
-            )
+            raise SplitShapeLenError(split_shapes)
     else:
         split_shapes = [get_local_channels(bs_size, rank=r) for r in range(tp_size())]
 
@@ -741,9 +768,7 @@ def _allgather_impl(input_tensor, batch_dim, split_shapes=None):
 
     if split_shapes != None:
         if len(split_shapes) != tp_size():
-            raise ValueError(
-                f"Split shapes {split_shapes} must have same length of tp_size {tp_size()}"
-            )
+            raise SplitShapeLenError(split_shapes)
     else:
         # If there is not split shapes, all tp ranks should share the same shape in batch_dim
         split_shapes = [input_tensor.size()[batch_dim] for _ in range(tp_size())]

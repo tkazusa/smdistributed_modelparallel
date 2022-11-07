@@ -7,6 +7,7 @@ import torch.nn as nn
 
 # First Party
 from smdistributed.modelparallel.torch.core import pp_rank
+from smdistributed.modelparallel.torch.exceptions import UnsupportedMessageError
 from smdistributed.modelparallel.torch.patches.checkpoint import CheckpointConfig
 from smdistributed.modelparallel.torch.pipeline import MbStatus
 from smdistributed.modelparallel.torch.state_mod import state
@@ -26,7 +27,7 @@ class StubbedMessage:
         """
         Convert the tensors which are members of this object to TensorStubs
         """
-        raise NotImplementedError
+        raise UnsupportedMessageError
 
     @classmethod
     def destubify(cls, msg, tensors: List[torch.Tensor]):

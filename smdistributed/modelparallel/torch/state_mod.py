@@ -12,6 +12,7 @@ import torch
 from smdistributed.modelparallel.backend.collectives import CommGroup, RankType
 from smdistributed.modelparallel.backend.state_mod import ModelParallelState
 from smdistributed.modelparallel.torch import smplib
+from smdistributed.modelparallel.torch.exceptions import CheckpointingError, SMPUnsupportedError
 from smdistributed.modelparallel.torch.handle_manager import HandleManager
 from smdistributed.modelparallel.torch.links import LinkManager
 from smdistributed.modelparallel.torch.module_manager import ModuleManager
@@ -178,7 +179,7 @@ class PTModelParallelState(ModelParallelState):
         elif self.cfg.pipeline == "_only_forward":
             self.pipeline = OnlyForwardPipeline()
         else:
-            raise ValueError("Pipeline not supported!")
+            raise SMPUnsupportedError("Pipeline not supported!")
 
     def init_model_specific_state(self):
         # The current microbatch for which we are constructing the graph, keyed by step_function id
@@ -193,6 +194,9 @@ class PTModelParallelState(ModelParallelState):
         self.checkpoint_activations_config = CheckpointConfig(enabled=False)
         self.phantom_structures = {}
         self.is_in_fwd_on_checkpointed_fn = False
+        self.loaded_model_state = None
+        self.loaded_optimizer_state = None
+        self.no_reinitialization = False  # internal usage for test purpose
 
         self.param_initializers = {}
 
@@ -209,6 +213,8 @@ class PTModelParallelState(ModelParallelState):
         self.link_manager.reset()
         self.checkpoint_nodes_cache.reset()
         self.serialization_manager.reset()
+        self.offloaders.clear()
+        self.tp_registry.reset()
 
     def current_minibatch(self):
         return self.current_step_func().minibatch
@@ -307,7 +313,8 @@ class PTModelParallelState(ModelParallelState):
         self.phantom_structures = {}
         self.module_manager.clear_minibatch_state()
         self.serialization_manager.clear_minibatch_state()
-        self.model.grad_counter.clear_minibatch_state()
+        if not self.cfg.zero2d_enabled():
+            self.model.grad_counter.clear_minibatch_state()
         self.checkpoint_nodes_cache.reset()
         self.link_manager.reset()
         if self.current_offloader() is not None:
@@ -325,7 +332,7 @@ class PTModelParallelState(ModelParallelState):
         else:
             if self.checkpoint_activations_config.enabled:
                 # prev config is already set
-                raise AssertionError(
+                raise CheckpointingError(
                     f"Checkpointing module {config.module_name} inside a checkpointed module {self.checkpoint_activations_config.module_name} is not supported."
                 )
 
@@ -388,6 +395,24 @@ class PTModelParallelState(ModelParallelState):
             if device != torch.device("cpu"):
                 with torch.cuda.device(device):
                     torch.cuda.set_rng_state(orig_cuda_rng_state)
+
+    def get_model_parallel_rank(self):
+        return self.core.mp_rank()
+
+    def get_model_parallel_group(self):
+        return self.mp_process_group
+
+    def get_model_parallel_world_size(self):
+        return self.core.mp_size()
+
+    def get_data_parallel_rank(self):
+        return self.core.rdp_rank()
+
+    def get_data_parallel_group(self):
+        return self.rdp_process_group
+
+    def get_data_parallel_world_size(self):
+        return self.core.rdp_size()
 
 
 state = PTModelParallelState()

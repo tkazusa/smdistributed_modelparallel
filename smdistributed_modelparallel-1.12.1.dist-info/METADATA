@@ -1,15 +1,11 @@
 Metadata-Version: 2.1
 Name: smdistributed-modelparallel
-Version: 1.7.0
-Summary: UNKNOWN
+Version: 1.12.1
 Home-page: https://w.amazon.com/bin/view/AWS_Tensorflow_Dashboard/ModelParallelism/
 Author: AWS SageMaker Distributed Model Parallelism Team
 Author-email: rubik-dev@amazon.com
-License: UNKNOWN
-Platform: UNKNOWN
 License-File: LICENSE.txt
+License-File: THIRD-PARTY-LICENSES.txt
 Requires-Dist: packaging
 Requires-Dist: pybind11
-
-UNKNOWN
 

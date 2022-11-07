@@ -13,6 +13,10 @@ import yaml
 
 try:
     from smdistributed.modelparallel.backend.logger import get_logger
+    from smdistributed.modelparallel.backend.exceptions import (
+        SMPInvalidArgumentError,
+        SMPConfigError,
+    )
 
     logger = get_logger()
     info_func = logger.info
@@ -23,6 +27,7 @@ except ImportError:
     info_func = print
     warn_func = print
     py_sdk = True
+    SMPInvalidArgumentError = ValueError
 
 
 def int_or_float_if_possible(s):
@@ -60,35 +65,35 @@ class ConfigParam:
     def _set_value(self, input_value):
         if not self.provided:
             if "default" not in self.cfg_dict:
-                raise ValueError(f"Config parameter {self.name} is required.")
+                raise SMPInvalidArgumentError(f"Config parameter {self.name} is required.")
 
             return self._get_default()
 
         if "type" in self.cfg_dict:
-            expected_type = locate(self.cfg_dict["type"])
-            if expected_type != type(input_value):
-                raise TypeError(
-                    f"Config parameter {self.name} needs to be of type {expected_type.__name__}. Found: {type(input_value)}"
+            expected_types = self._parse_allowed_types(self.cfg_dict["type"])
+            if type(input_value) not in expected_types:
+                raise SMPInvalidArgumentError(
+                    f"Config parameter {self.name} type needs to be one of {[e.__name__ for e in expected_types]}. Found: {type(input_value).__name__}."
                 )
 
         if "options" in self.cfg_dict:
             options = self._handle_dependencies(self.cfg_dict["options"])
             if input_value not in options:
-                raise ValueError(
+                raise SMPInvalidArgumentError(
                     f"Config parameter {self.name} must be one of {self.cfg_dict['options']}. Found: {input_value}."
                 )
 
         if "lower_bound" in self.cfg_dict:
             lower_bound = self._handle_dependencies(self.cfg_dict["lower_bound"])
             if input_value < lower_bound:
-                raise ValueError(
+                raise SMPInvalidArgumentError(
                     f"Config parameter {self.name} ({input_value}) cannot be less than {self.cfg_dict['lower_bound']} ({lower_bound})."
                 )
 
         if "upper_bound" in self.cfg_dict:
             upper_bound = self._handle_dependencies(self.cfg_dict["upper_bound"])
             if input_value > upper_bound:
-                raise ValueError(
+                raise SMPInvalidArgumentError(
                     f"Config parameter {self.name} ({input_value}) cannot be larger than {self.cfg_dict['upper_bound']} ({upper_bound})."
                 )
 
@@ -96,7 +101,7 @@ class ConfigParam:
             default = self._get_default()
             for k, v in self.cfg_dict["requires"].items():
                 if self.existing_params[k].get_value() != v and input_value != default:
-                    raise ValueError(
+                    raise SMPInvalidArgumentError(
                         f"Setting config parameter {self.name} to non-default value {input_value} requires {k} to be set to {v}. Found: {self.existing_params[k].get_value()}"
                     )
 
@@ -104,8 +109,23 @@ class ConfigParam:
             default = self._get_default()
             for k, v in self.cfg_dict["requires_not"].items():
                 if self.existing_params[k].get_value() == v and input_value != default:
-                    raise ValueError(
+                    raise SMPInvalidArgumentError(
                         f"Setting config parameter {self.name} to non-default value {input_value} requires {k} to not be {v}."
+                    )
+
+        if "requires_either" in self.cfg_dict:
+            default = self._get_default()
+            if input_value != default:
+                provided_configs = {}
+                requirement_satisfied = False
+                for k, v in self.cfg_dict["requires_either"].items():
+                    if self.existing_params[k].get_value() == v:
+                        requirement_satisfied = True
+                        break
+                    provided_configs[k] = self.existing_params[k].get_value()
+                if not requirement_satisfied:
+                    raise SMPInvalidArgumentError(
+                        f"Setting config parameter {self.name} to non-default value {input_value} requires either of following configs: {self.cfg_dict['requires_either']} But the configs found are: {provided_configs}"
                     )
 
         return input_value
@@ -121,7 +141,10 @@ class ConfigParam:
             tokens = re.split("\\+|\\-|\\*|\\/", value)
             ops = [c for c in value if c in ["+", "-", "*", "/"]]
 
-            assert len(tokens) == len(ops) + 1, f"Malformed formula: {value}"
+            if len(tokens) != len(ops) + 1:
+                raise SMPConfigError(
+                    f"Malformed formula: {value}. This is a bug that should be reported."
+                )
 
             # if there are operations, all terms must be convertible to float or int
             # if not, cur_value can be a string
@@ -139,6 +162,20 @@ class ConfigParam:
             return cur_value
         else:
             return value
+
+    def _parse_allowed_types(self, types):
+        def _parse(t):
+            if t is None:
+                return type(None)
+            elif isinstance(t, str):
+                return locate(t)
+            else:
+                raise ValueError(f"Invalid type {t} in config schema.")
+
+        if isinstance(types, list):
+            return [_parse(typ) for typ in types]
+        else:
+            return [_parse(types)]
 
 
 class DependencyIterator:
@@ -183,7 +220,7 @@ class ModelParallelConfig:
         for alias, orig in aliases.items():
             if alias in config:
                 if orig in config and config[alias] != config[orig]:
-                    raise ValueError(
+                    raise SMPInvalidArgumentError(
                         f"Conflicting values {config[orig]} and {config[alias]} are provided for config parameter {orig} and its alias {alias}."
                     )
                 config[orig] = config[alias]
@@ -192,7 +229,7 @@ class ModelParallelConfig:
         # make sure there are no invalid config parameters
         for k in config:
             if k not in schema:
-                raise ValueError(f"Unrecognized config parameter {k}.")
+                raise SMPInvalidArgumentError(f"Unrecognized config parameter {k}.")
 
         # parse and validate the inputs
         params = {}
@@ -207,6 +244,9 @@ class ModelParallelConfig:
 
         self._input_config = config
         self._config_dict = params
+
+        # enable fp16 and fp16_param backward compatibility
+        self._fp16_param_init = self.fp16 or self.fp16_params
 
         # enforce additional constraints - need to be careful here to make sure these do not conflict with the
         # existing constraints
@@ -223,11 +263,43 @@ class ModelParallelConfig:
             )
             self.checkpoint_attentions = False
 
-    def display_config(self):
-        assert hasattr(self, "_config_dict")
+        self._zero2d_config_dict = {}
 
+    def zero2d_enabled(self):
+        return self.sharded_data_parallel_degree > 1
+
+    def zero2d_config_dict(self):
+        return self._zero2d_config_dict
+
+    def construct_zero2d_config_dict(self, smp_core):
+        if not py_sdk:
+            from smdistributed.modelparallel.backend.zero_config import construct_zero2d_config_dict
+
+            self._zero2d_config_dict = construct_zero2d_config_dict(self, smp_core)
+
+    def get_config_dict(self):
+        if not hasattr(self, "_config_dict"):
+            raise SMPInvalidArgumentError("ModelParallelConfig should contain _config_dict attr")
+        return {key: val.get_value() for key, val in self._config_dict.items()}
+
+    def display_config(self):
+        if not hasattr(self, "_config_dict"):
+            raise SMPConfigError(
+                "ModelParallelConfig should contain _config_dict attr. This is a bug that should be reported."
+            )
+
+        deprecated_configs = {}
         if not py_sdk:
             info_func("Configuration parameters:")
             for k, v in self._config_dict.items():
                 if "internal" not in v.cfg_dict or not v.cfg_dict["internal"]:
                     info_func(f"  {k}: {v.get_value()}")
+                if "deprecated" in v.cfg_dict and v.cfg_dict["deprecated"]:
+                    deprecated_configs[k] = v
+            for k, v in deprecated_configs.items():
+                if "replacement" in v.cfg_dict:
+                    warn_func(
+                        f"WARNING: \"{k}\" is a deprecated config key, please use \"{v.cfg_dict['replacement']}\" instead"
+                    )
+                else:
+                    warn_func(f'WARNING: "{k}" is a deprecated config key')

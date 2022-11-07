@@ -57,7 +57,7 @@ class PTCollectiveCommunicator(CollectiveCommunicator):
         stubs = state.serialization_manager.extract_stubs(stubbed_obj)
 
         for stub in stubs:
-            tensor = torch.empty((0,), device="cpu")
+            tensor = torch.empty((0,), device=torch.device("cuda", core.local_rank()))
             handles.append(recv_tensor(tensor, stub.src, stub.link_id, server=False))
 
         for handle in handles:
@@ -105,7 +105,7 @@ class PTCollectiveCommunicator(CollectiveCommunicator):
         stubs = state.serialization_manager.extract_stubs(stubbed_obj)
 
         for stub in stubs:
-            tensor = torch.empty((0,), device="cpu")
+            tensor = torch.empty((0,), device=torch.device("cuda", core.local_rank()))
             handles.append(recv_tensor(tensor, stub.src, stub.link_id, server=False))
         return handles, stubbed_obj
 

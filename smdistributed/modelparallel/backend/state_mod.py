@@ -6,6 +6,7 @@ from smdistributed.modelparallel.backend.collectives import (
     CommGroup,
     RankType,
 )
+from smdistributed.modelparallel.backend.exceptions import InvalidLinkIDError
 from smdistributed.modelparallel.backend.logger import get_logger
 from smdistributed.modelparallel.backend.utils import bijection_2d
 
@@ -89,4 +90,4 @@ class ModelParallelState:
         for att, id in self.link_id_map.items():
             if id == link_id:
                 return att
-        raise ValueError(f"Link id {link_id} does not exist!")
+        raise InvalidLinkIDError(f"Link id {link_id} does not exist!")

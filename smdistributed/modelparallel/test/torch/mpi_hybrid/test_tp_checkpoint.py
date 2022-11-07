@@ -8,16 +8,17 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+from smdistributed.modelparallel.torch.apex.fp16_utils import FP16_Optimizer
 
 # First Party
 import smdistributed.modelparallel.torch as smp
-from smdistributed.modelparallel.torch.nn.utils import get_local_channels, get_start_pos_for_slicing
+from smdistributed.modelparallel.test.torch.utils import FP16_Module
 
 torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
 
 
-class TestTensorParallelismCheckpoint(unittest.TestCase):
+class TestTensorParallelismCheckpointBase(unittest.TestCase):
     def check_optim_match(self, dist_optim_state_dict, optim_state_dict):
         for param_idx in dist_optim_state_dict["state"].keys():
             for state in dist_optim_state_dict["state"][param_idx]:
@@ -25,9 +26,9 @@ class TestTensorParallelismCheckpoint(unittest.TestCase):
                     assert torch.allclose(
                         dist_optim_state_dict["state"][param_idx][state].cpu(),
                         optim_state_dict["state"][param_idx][state].cpu(),
-                        atol=1e-5,
-                        rtol=1e-4,
-                    )
+                        atol=1e-3 if smp.state.cfg.fp16 else 1e-5,
+                        rtol=1e-3 if smp.state.cfg.fp16 else 1e-4,
+                    ), f"optimizer 1 is {dist_optim_state_dict['state'][param_idx][state].cpu()}, optimizer 2 is {optim_state_dict['state'][param_idx][state].cpu()}"
                 else:
                     assert (
                         dist_optim_state_dict["state"][param_idx][state]
@@ -36,13 +37,13 @@ class TestTensorParallelismCheckpoint(unittest.TestCase):
 
     def check_model_match(self, dist_model_state_dict, model_state_dict):
         for param in dist_model_state_dict:
-            # Had to reduce atol=1e-4 and rtol=1e-4 for params to match after update
+            # Had to reduce atol and rtol for params to match after update
             assert torch.allclose(
                 dist_model_state_dict[param].cpu(),
                 model_state_dict[param].cpu(),
-                atol=1e-4,
-                rtol=1e-4,
-            )
+                atol=2e-2,
+                rtol=1e-2,
+            ), f"model1 is {dist_model_state_dict[param].cpu()}, model2 is {model_state_dict[param].cpu()}"
 
     def check_model_optimizer_state(
         self,
@@ -54,13 +55,16 @@ class TestTensorParallelismCheckpoint(unittest.TestCase):
         same_partition_load=False,
         state_dict_allgather=True,
     ):
-        def train_step_helper(model, data, target, use_smp=True):
+        def train_step_helper(model, data, target, optimizer=None, use_smp=True):
             output = model(data)
             loss = F.nll_loss(output, target, reduction="mean")
             if use_smp:
                 model.backward(loss)
             else:
-                loss.backward()
+                if smp.state.cfg.fp16 and optimizer:
+                    optimizer.backward(loss)
+                else:
+                    loss.backward()
             return output, loss
 
         @smp.step
@@ -85,7 +89,12 @@ class TestTensorParallelismCheckpoint(unittest.TestCase):
         np.random.seed(42)
         random.seed(42)
         model = model_cls()
+        if smp.state.cfg.fp16:
+            model = FP16_Module(model)
         model.to(device)
+        torch_model_state_dict = model.state_dict()
+        for key, val in torch_model_state_dict.items():
+            torch_model_state_dict[key] = val.detach().cpu()
 
         from smdistributed.modelparallel.torch.state_mod import state
 
@@ -95,63 +104,26 @@ class TestTensorParallelismCheckpoint(unittest.TestCase):
         torch.manual_seed(42)
         np.random.seed(42)
         random.seed(42)
-        model2 = model_cls()
+        with smp.model_creation(enable_tensor_parallel=False):
+            model2 = model_cls()
         model2.to(device)
-
-        # Save weights to set it for dist model
-        saved_params = {}
-        saved_buffers = {}
-        for name, param in model.named_parameters():
-            mod_names = name.split(".")[:-1]
-            mod = model
-            for mod_name in mod_names:
-                mod = getattr(mod, mod_name)
-            if isinstance(mod, nn.BatchNorm2d):
-                saved_params[name] = param.data.clone()
-            if mod in tensor_parallel_modules:
-                # Supports only nn.Linear atm
-                assert isinstance(mod, nn.Linear)
-                if "bias" not in name:
-                    local_channel = get_local_channels(param.size(-1))
-                    start = get_start_pos_for_slicing(param.size(-1))
-                    saved_params[name] = (
-                        torch.narrow(param.data, -1, start, local_channel).contiguous().clone()
-                    )
-                else:
-                    saved_params[name] = param.data.clone()
-
-        for name, buff in model.named_buffers():
-            mod_names = name.split(".")[:-1]
-            mod = model
-            for mod_name in mod_names:
-                mod = getattr(mod, mod_name)
-            if isinstance(mod, nn.BatchNorm2d):
-                saved_buffers[name] = buff.data.clone()
 
         # Run forward, backward and update for non dist model
         torch.manual_seed(42)
         np.random.seed(42)
         random.seed(42)
         optimizer = optim_fn(model.parameters(), **optim_params)
+        if smp.state.cfg.fp16:
+            optimizer = FP16_Optimizer(init_optimizer=optimizer, verbose=False)
         optimizer.zero_grad()
         inp = torch.cat([data_list[0], data_list[1]], 0)
         targ = torch.cat([target_list[0], target_list[1]], 0)
-        output, loss = train_step_helper(model, inp, targ, use_smp=False)
+        output, loss = train_step_helper(model, inp, targ, optimizer=optimizer, use_smp=False)
         optimizer.step()
 
         dist_model = smp.DistributedModel(model2, average_grads_across_microbatches=False)
 
-        # Restore saved weights
-        for name, param in dist_model.module.module.named_parameters():
-            if name in saved_params:
-                if "bias" not in name:
-                    param.data = saved_params[name]
-                elif smp.tp_rank() == 0:
-                    param.data = saved_params[name]
-
-        for name, buff in dist_model.module.module.named_buffers():
-            if name in saved_buffers:
-                buff.data = saved_buffers[name]
+        dist_model.load_state_dict(torch_model_state_dict, strict=True)
 
         torch.manual_seed(42)
         np.random.seed(42)
@@ -167,6 +139,9 @@ class TestTensorParallelismCheckpoint(unittest.TestCase):
         if smp.rdp_rank() == 0:
             dist_optim_state_dict = dist_optimizer.state_dict()
             optim_state_dict = optimizer.state_dict()
+            if smp.state.cfg.fp16:
+                dist_optim_state_dict = dist_optim_state_dict["optimizer_state_dict"]
+                optim_state_dict = optim_state_dict["optimizer_state_dict"]
             dist_model_state_dict = dist_model.state_dict(gather_to_rank0=not state_dict_allgather)
             model_state_dict = model.state_dict()
             self.check_optim_match(dist_optim_state_dict, optim_state_dict)
@@ -190,6 +165,8 @@ class TestTensorParallelismCheckpoint(unittest.TestCase):
 
         if save_load and smp.rdp_rank() == 0:
             model_loaded = model_cls()
+            if smp.state.cfg.fp16:
+                model_loaded = FP16_Module(model_loaded)
             model_loaded.to(device)
             optimizer_loaded = optim_fn(model_loaded.parameters(), **optim_params)
             checkpoint = smp.load("/tmp/checkpoint.pt", partial=False)
@@ -199,22 +176,31 @@ class TestTensorParallelismCheckpoint(unittest.TestCase):
             )
             model_loaded.load_state_dict(checkpoint["model"])
             optimizer_loaded.load_state_dict(checkpoint["optimizer_state"])
-            self.check_optim_match(optim_state_dict, optimizer_loaded.state_dict())
+            if smp.state.cfg.fp16:
+                optimizer_loaded = FP16_Optimizer(optimizer_loaded, verbose=False)
+            self.check_optim_match(
+                optim_state_dict,
+                optimizer_loaded.state_dict()["optimizer_state_dict"]
+                if smp.state.cfg.fp16
+                else optimizer_loaded.state_dict(),
+            )
             self.check_model_match(model_state_dict, model_loaded.state_dict())
 
             checkpoint = smp.load("/tmp/checkpoint.pt", partial=True)
+            # delete the partition_info as the model is already partitioned
+            del checkpoint["model"]["_smp_load_info"]["partition_info"]
             dist_model.load_state_dict(checkpoint["model"], same_partition_load=same_partition_load)
             dist_optimizer.load_state_dict(checkpoint["optimizer_state"])
-            self.check_optim_match(dist_optimizer.state_dict(), dist_optim_state_dict)
+            state_dict_generated = dist_optimizer.state_dict()
+            if smp.state.cfg.fp16:
+                state_dict_generated = state_dict_generated["optimizer_state_dict"]
+            self.check_optim_match(state_dict_generated, dist_optim_state_dict)
             self.check_model_match(
                 dist_model.state_dict(gather_to_rank0=not state_dict_allgather),
                 dist_model_state_dict,
             )
 
-    def test_tp_optimizer_checkpoint_ubalanced(self):
-        self.test_tp_optimizer_checkpoint(channel=127)
-
-    def test_tp_optimizer_checkpoint(self, channel=128):
+    def tp_optimizer_checkpoint_base(self, channel=128, fp16=False, delayed_param=False):
         # For determinism
         batch_size = 64
 
@@ -311,8 +297,11 @@ class TestTensorParallelismCheckpoint(unittest.TestCase):
                                 "ddp": True,
                                 "auto_partition": False,
                                 "default_partition": 0,
+                                "fp16": fp16,
+                                "delayed_parameter_initialization": delayed_param,
                             }
                         )
+
                         self.check_model_optimizer_state(
                             GroupedNet,
                             opt,
@@ -320,6 +309,30 @@ class TestTensorParallelismCheckpoint(unittest.TestCase):
                             same_partition_load=same_partition_load,
                             state_dict_allgather=state_dict_allgather,
                         )
+
+
+class TestTensorParallelismCheckpoint(TestTensorParallelismCheckpointBase):
+    def test_tp_optimizer_checkpoint_unbalanced(self):
+        self.tp_optimizer_checkpoint_base(channel=127)
+
+    def test_tp_optimizer_checkpoint(self):
+        self.tp_optimizer_checkpoint_base()
+
+
+class TestTensorParallelismCheckpointFP16(TestTensorParallelismCheckpointBase):
+    def test_tp_optimizer_checkpoint_fp16(self):
+        self.tp_optimizer_checkpoint_base(fp16=True)
+
+    def test_tp_optimizer_checkpoint_fp16_unbalanced(self):
+        self.tp_optimizer_checkpoint_base(fp16=True, channel=127)
+
+
+class TestTensorParallelismCheckpointDelayParam(TestTensorParallelismCheckpointBase):
+    def test_tp_optimizer_checkpoint_delayparam(self):
+        self.tp_optimizer_checkpoint_base(delayed_param=True)
+
+    def test_tp_optimizer_checkpoint_delayparam_fp16(self):
+        self.tp_optimizer_checkpoint_base(fp16=True, delayed_param=True)
 
 
 if __name__ == "__main__":

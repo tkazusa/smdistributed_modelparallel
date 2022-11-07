@@ -7,11 +7,12 @@ import torch
 from torch.nn.parameter import Parameter
 
 from smdistributed.modelparallel.backend.logger import get_logger
+from smdistributed.modelparallel.torch.exceptions import SMPUnsupportedError
 
 logger = get_logger()
 
 
-def log_backward_graph(var_grad_fn, level=0):
+def log_backward_graph(var_grad_fn, level=0):  # pragma: no cover
     """
     Takes a grad function for a torch tensor
     Helper function to print the sequence of ops executed in the backward pass
@@ -52,9 +53,12 @@ def get_ancestors(
     Params, SMPInput nodes, and SMPRecv nodes
     """
 
-    assert (
-        isinstance(outputs, torch.Tensor) or isinstance(outputs, list) or isinstance(outputs, tuple)
-    ), "inputs should be Tensor or list or tuple"
+    if (
+        not isinstance(outputs, torch.Tensor)
+        and not isinstance(outputs, list)
+        and not isinstance(outputs, tuple)
+    ):
+        raise SMPUnsupportedError("inputs should be Tensor or list or tuple")
 
     visited = set()
     stack = []

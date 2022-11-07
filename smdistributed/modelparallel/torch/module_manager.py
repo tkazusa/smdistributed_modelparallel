@@ -12,6 +12,20 @@ from torch.utils.hooks import RemovableHandle
 # First Party
 from smdistributed.modelparallel.backend.logger import get_logger
 from smdistributed.modelparallel.torch.core import local_rank, pp_rank, pp_size, rank
+from smdistributed.modelparallel.torch.exceptions import (
+    CheckpointingConfigError,
+    DistributedModelNotWrappedError,
+    DistributedModelWrappedError,
+    InvalidPartitionIDError,
+    MissingModuleError,
+    MissingOutputForModuleError,
+    MissingParentModuleError,
+    PipelineParallelBWDError,
+    SMPCheckpointError,
+    SMPRuntimeError,
+    StepFunctionCalledError,
+    UnsupportedCommunicationVolumeUnitError,
+)
 from smdistributed.modelparallel.torch.module_partition import ModulePartitioner
 from smdistributed.modelparallel.torch.patches.checkpoint import CheckpointConfig
 from smdistributed.modelparallel.torch.utils import get_tensor_size, rmsg
@@ -69,7 +83,7 @@ class ModuleManager:
         # set of modules for which we will apply tensor parallelism
         self._tensor_parallelism_modules = set()
 
-        # mapping from module id to dict containing optional config for distribution
+        # mapping from module to dict containing optional config for distribution
         self._tensor_parallelism_config = {}
 
         # the configuration to be used for the tensor-parallel modules marked in the current context
@@ -217,6 +231,12 @@ class ModuleManager:
         # hooks to be called after the first execution of smp.step
         self._post_step_hooks = OrderedDict()
 
+        # whether the partition is loaded from a checkpoint
+        self.partition_loaded = False
+
+        # list of tuple (smp_to_hf, hf_to_smp) state_dict translate function
+        self.translate_functions = []
+
     def add_scaled_batch_parameter(self, param):
         self._scaled_batch_parameters.add(param)
 
@@ -255,6 +275,49 @@ class ModuleManager:
         """ If not distributed returns None """
         return self._distributed_buffers.get(buf, None)
 
+    def update_fake_tensor(self, fake_to_materialized_param, fake_to_materialized_buffer):
+        """
+        When initialized with deferred_init, recorded tensors are fake ones. Replace them with the materalized real tensors.
+        """
+        for fake, real in fake_to_materialized_param.items():
+            if fake in self._scaled_batch_parameters:
+                self._scaled_batch_parameters.remove(fake)
+                self._scaled_batch_parameters.add(real)
+            if fake in self._one_rank_parameters:
+                self._one_rank_parameters.remove(fake)
+                self._one_rank_parameters.add(real)
+            if fake in self._distributed_parameters:
+                axis = self._distributed_parameters[fake]
+                del self._distributed_parameters[fake]
+                self._distributed_parameters[real] = axis
+
+        for fake, real in fake_to_materialized_buffer.items():
+            if fake in self._scaled_batch_buffers:
+                self._scaled_batch_buffers.remove(fake)
+                self._scaled_batch_buffers.add(real)
+            if fake in self._one_rank_buffers:
+                self._one_rank_buffers.remove(fake)
+                self._one_rank_buffers.add(real)
+            if fake in self._distributed_buffers:
+                axis = self._distributed_buffers[fake]
+                del self._distributed_buffers[fake]
+                self._distributed_buffers[real] = axis
+
+    def register_translate_function(self, translate_functions):
+        self.translate_functions.append(translate_functions)
+
+    def get_model_partition_info(self):
+        from smdistributed.modelparallel.torch.state_mod import state
+
+        if not state.model.partitioned:
+            raise SMPUnsupportedError(
+                "get_model_partition_info can only be called after the model partition."
+            )
+        model_partition = {}
+        for name, module in self._name_to_module.items():
+            model_partition[name] = self._module_partitions[module]
+        return model_partition
+
     def register_post_step_hook(self, hook):
         from smdistributed.modelparallel.torch.state_mod import state
 
@@ -281,9 +344,10 @@ class ModuleManager:
         """ Replace the original module with the new one in the internal data structures """
         from smdistributed.modelparallel.torch.state_mod import state
 
-        assert (
-            not state.model.partitioned
-        ), "Module replacement can only happen before the model partition."
+        if state.model.partitioned:
+            raise SMPUnsupportedError(
+                "Module replacement can only happen before the model partition."
+            )
 
         name = self._module_to_name[old_module]
         self._module_to_name[new_module] = name
@@ -444,9 +508,7 @@ class ModuleManager:
             outp = self._module_outputs[mb][(parent_module_name, module_name)][position]
             return outp
         except IndexError as e:
-            raise RuntimeError(
-                f"Could not fetch output for mb: {mb}, parent: {parent_module_name}, module: {module_name} with position {position} as it was not saved."
-            )
+            raise MissingOutputForModuleError(mb, parent_module_name, module_name, position)
 
     def enqueue_bwd_tensors(
         self,
@@ -457,9 +519,10 @@ class ModuleManager:
     ):
         """Pushes tensors from a backward request onto a queue given a microbatch, module and a parent module
         """
-        assert (
-            len(tensors) == 2
-        ), "tensors should contain two tuples or two tensors: one for output and another for grads"
+        if len(tensors) != 2:
+            raise PipelineParallelBWDError(
+                "tensors should contain two tuples or two tensors: one for output and another for grads"
+            )
         module_name = self.get_module_name(module)
         parent_module_name = self.get_module_name(parent_module)
         self._bwd_tensors[mb][(parent_module_name, module_name)].append(tensors)
@@ -521,9 +584,8 @@ class ModuleManager:
         self._to_send_dummy[mb][parent_module_name][module_name] = (
             self._to_send_dummy[mb][parent_module_name][module_name] + count
         )
-        assert (
-            self._to_send_dummy[mb][parent_module_name][module_name] >= 0
-        ), "shouldnt go less than 0, there is a bug"
+        if self._to_send_dummy[mb][parent_module_name][module_name] < 0:
+            raise PipelineParallelBWDError("shouldnt go less than 0, there is a bug")
 
     def decrement_dummy_bwd_sends(
         self, mb: int, module: nn.Module, parent_module: nn.Module, count: int
@@ -577,12 +639,10 @@ class ModuleManager:
         else:
             recv = self._to_recv_real if real else self._to_recv_dummy
         recv[mb][parent_module_name][module_name] += count
-        assert recv[mb][parent_module_name][module_name] >= 0, (
-            mb,
-            parent_module_name,
-            module_name,
-            "shouldnt go less than 0, there is a bug",
-        )
+        if recv[mb][parent_module_name][module_name] < 0:
+            raise PipelineParallelBWDError(
+                f"{mb}, {parent_module_name}, {module_name}, shouldnt go less than 0, there is a bug"
+            )
 
         self._update_parent_pending_counts(module_name, parent_module_name, mb, count, set())
 
@@ -646,7 +706,8 @@ class ModuleManager:
         """
         current_mod = module
         current_mod_name = self.get_module_name(module)
-        assert self.is_executor(current_mod), "the rank needs to be executor of the module"
+        if not self.is_executor(current_mod):
+            raise SMPRuntimeError("the rank needs to be executor of the module")
         if self.is_main_module(current_mod) or not self.is_parent_executor(current_mod):
             # parent of main is None
             return self.get_parent_module(current_mod), current_mod
@@ -687,9 +748,7 @@ class ModuleManager:
             else:
                 index = self.execution_stack.index(module_name)
                 return self._module_execution_stack[index - 1] if index > 0 else None
-        raise RuntimeError(
-            f"Exec stack was {self.execution_stack}; could not find parent_module of {self.get_module_name(module)}"
-        )
+        raise MissingParentModuleError(self.execution_stack, self.get_module_name(module))
 
     def get_parameters(self, module, recurse=True):
         """
@@ -703,7 +762,8 @@ class ModuleManager:
 
     def is_executor(self, module: nn.Module) -> bool:
         partition = self.get_partition(module)
-        assert partition is not None, (module, "is not assigned any partition")
+        if partition is None:
+            raise SMPRuntimeError(f"{module} is not assigned any partition")
         return partition == pp_rank()
 
     def is_parent_executor(self, module: nn.Module) -> bool:
@@ -736,12 +796,14 @@ class ModuleManager:
         """Gets parent and grand parent of a module"""
         if not self._module_to_name:
             self.name_modules_and_create_parent_map()
-        assert not self.is_main_module(module), "cannot get_immediate_ancestors for main module"
+        if self.is_main_module(module):
+            raise SMPRuntimeError("cannot get_immediate_ancestors for main module")
         stack_parent_module = self.get_parent_module(module)
         module_name = self.get_module_name(module)
         stack_parent_name = self.get_module_name(stack_parent_module)
         ancestors = self._get_ancestors(module_name, stack_parent_name)
-        assert len(ancestors) >= 2, "ancestors should atleast hold this module and parent"
+        if len(ancestors) < 2:
+            raise SMPRuntimeError("ancestors should at least hold this module and parent")
         if len(ancestors) == 2:
             if self._parent_map[ancestors[-1]]:
                 grand_parent_name = self._parent_map[ancestors[-1]][-1]
@@ -779,7 +841,7 @@ class ModuleManager:
                 new_path = list(current_path)
                 new_path.append(parent)
                 queue.append(new_path)
-        assert False, f"path not found between {module_name} and {stack_parent_name}"
+        raise SMPRuntimeError(f"path not found between {module_name} and {stack_parent_name}")
 
     def finished_module_exec(self):
         self._module_execution_stack.pop()
@@ -814,7 +876,15 @@ class ModuleManager:
         self._smpinput_bwd_counts.clear()
 
     def clear_tensor_parallelism_modules(self):
+        # Remove references for the origin modules that are replaced by tp counterparts
+        for m in self._tensor_parallelism_modules:
+            for child in m.modules():
+                if child in self._module_partitions:
+                    del self._module_partitions[child]
+            if m in self._module_partitions:
+                del self._module_partitions[m]
         self._tensor_parallelism_modules.clear()
+        self._tensor_parallelism_config.clear()
 
     def auto_partition_model(self, model, root_rank):
 
@@ -901,27 +971,40 @@ class ModuleManager:
     ):
         from smdistributed.modelparallel.torch.state_mod import state
 
+        if pack_args_as_tuple:
+            logger.warning(
+                "pack_args_as_tuple argument is deprecated, and will be removed in a future version of smp. This argument is a no-op and is not required."
+            )
+
         if not state.model:
-            raise RuntimeError(
-                "set_activation_checkpointing can only be called on a module after wrapping the main model with smp.DistributedModel"
+            raise DistributedModelNotWrappedError(
+                "set_activation_checkpointing can be called on a module"
             )
 
         """ Enable activation checkpointing for the given module. """
         if not isinstance(module, nn.Module):
-            raise ValueError(
+            raise CheckpointingConfigError(
                 "Only a module of type nn.Module can be passed for activation checkpointing"
             )
         if not isinstance(module, nn.Sequential):
-            if pack_args_as_tuple:
-                raise ValueError("pack_args_as_tuple can be True only for Sequential modules")
             if strategy != "each":
                 # each is just the default, if user tries to change this, we throw error
-                raise ValueError("strategy can only be used when checkpointing Sequential modules")
+                raise CheckpointingConfigError(
+                    "strategy can only be used when checkpointing Sequential modules"
+                )
+
+        if state.cfg.zero2d_enabled():
+            module_params = {p for p in module.parameters()}
+
+            # current limitation with zero2d: modules that share parameters cannot be checkpointed - causes accuracy issues. TODO: fix
+            if any((len(state.model.get_module_for_param(p)) > 1) for p in module_params):
+                raise CheckpointingConfigError(
+                    f"When sharded data parallelism is enabled, modules that share parameters cannot be checkpointed. Offending module: {self._module_to_name[module]}."
+                )
 
         self._activation_checkpoint_modules_config[module] = CheckpointConfig(
             enabled=True,
             preserve_rng_state=preserve_rng_state,
-            pack_args_as_tuple=pack_args_as_tuple,
             module_name=self.get_module_name(module),
             strategy=strategy,
         )
@@ -932,9 +1015,7 @@ class ModuleManager:
         from smdistributed.modelparallel.torch.state_mod import state
 
         if state.model:
-            raise RuntimeError(
-                "set_tensor_parallelism API can only be used before creating the smp.DistributedModel object."
-            )
+            raise DistributedModelWrappedError("using the set_tensor_parallelism API")
 
         if not enabled:
             # if disabling, disable for the entire subtree
@@ -960,6 +1041,23 @@ class ModuleManager:
                     else:
                         stack.extend([c for c in m.children()])
 
+    def _verify_partition_info(self, partition_info):
+        loaded_modules = set(partition_info.keys())
+        existing_modules = set(self._name_to_module.keys())
+        extra_loaded = loaded_modules.difference(existing_modules)
+        missing_existing = existing_modules.difference(loaded_modules)
+        if len(extra_loaded) > 0 or len(missing_existing) > 0:
+            raise SMPCheckpointError(
+                f"Error: Loading a checkpoint with extra modules names {extra_loaded} and missing module names {missing_existing}. Please check if you are loading checkpoint for the same model"
+            )
+
+    def load_partition(self, partition_info):
+        self.name_modules_and_create_parent_map()
+        self._verify_partition_info(partition_info)
+        for name, m in self._name_to_module.items():
+            self._module_partitions[m] = partition_info[name]
+        self.partition_loaded = True
+
     def set_partition(self, module, partition, recurse=True):
         """
         Assign the given module to the specified partition. Can only be called between creation of smp.DistributedModel and
@@ -968,17 +1066,24 @@ class ModuleManager:
         from smdistributed.modelparallel.torch.state_mod import state
 
         if state.model.partitioned:
-            raise RuntimeError(
-                "set_partition API can only be used before the first call to an smp.step-decorated function."
-            )
+            raise StepFunctionCalledError("using set_partition API")
 
         if self.cfg.auto_partition:
+            if rank() == 0:
+                logger.warning(
+                    "auto_partition is set to True, ignoring manual setting partition..."
+                )
+            return
+
+        if self.partition_loaded:
+            if rank() == 0:
+                logger.warning(
+                    "partition is loaded from checkpoint, ignoring manual setting partition..."
+                )
             return
 
         if partition < 0 or partition >= self.cfg.pipeline_parallel_degree:
-            raise ValueError(
-                "Partition ID must be non-negative, and less than the pipeline parallel degree."
-            )
+            raise InvalidPartitionIDError
 
         self._module_partitions[module] = partition
 
@@ -1063,9 +1168,7 @@ class ModuleManager:
             yield
         else:
             if i < 0 or i >= self.cfg.pipeline_parallel_degree:
-                raise ValueError(
-                    "Partition ID must be non-negative, and less than the pipeline parallel degree."
-                )
+                raise InvalidPartitionIDError
 
             _prev_partition = self._cur_partition
             self._cur_partition = i
@@ -1133,9 +1236,7 @@ class ModuleManager:
         try:
             return self._module_to_name[module]
         except KeyError:
-            raise RuntimeError(
-                f"Cannot find the name for the module {module}. This is commonly caused by module instantiation inside a forward() method. Please create all child modules inside the __init__ method of its parent module."
-            )
+            raise MissingModuleError(module)
 
     def get_module(self, name: str):
         if not self._module_to_name:
@@ -1288,4 +1389,4 @@ class ModuleManager:
         elif unit == "GB":
             return comm_vol / 1e9
         else:
-            raise ValueError(f"Unsupported unit {unit}")
+            raise UnsupportedCommunicationVolumeUnitError(unit)

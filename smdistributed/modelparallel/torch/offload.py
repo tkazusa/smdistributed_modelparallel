@@ -1,5 +1,5 @@
 # Standard Library
-from collections import OrderedDict, defaultdict
+from collections import OrderedDict, defaultdict, deque, namedtuple
 from typing import Tuple
 
 # Third Party
@@ -22,46 +22,55 @@ def can_shard_activation_offloading(module):
     return module.can_shard_activation_offloading()
 
 
+TensorSpec = namedtuple("TensorSpec", ["requires_grad", "dtype", "shape"])
+
+
 class OffloadRegistry:
     """ Keeps track of wrapping objects and tensor attributes for the offloading inputs """
 
     def __init__(self):
-        # task -> list(stubified objects)
-        self.stubified = defaultdict(list)
+        # task -> list(dummy objects)
+        self.counts = defaultdict(int)
 
-        # (task, item_id) -> list(stubs)
-        self.stubs = defaultdict(list)
+        # (task, item_id) -> list(bool)
+        self.requires_grad = defaultdict(list)
 
-    def put(self, task, obj):
-        from smdistributed.modelparallel.torch.state_mod import state
+        # (task, item_id) -> list(torch.dtype)
+        self.dtype = defaultdict(list)
 
-        item_id = len(self.stubified[task])
+        # (task, item_id) -> list(list)
+        self.shape = defaultdict(list)
+
+    def put(self, task, tensors):
+        item_id = self.counts[task]
         _id = (task, item_id)
 
-        stubified, tx_list = state.serialization_manager.serialize(
-            obj, False, [0], for_offload=True
-        )
-        stubs = state.serialization_manager.extract_stubs(stubified)
+        self.counts[task] += 1
+        self.requires_grad[(task, item_id)] = [t.requires_grad for t in tensors]
+        self.dtype[(task, item_id)] = [t.dtype for t in tensors]
+        self.shape[(task, item_id)] = [list(t.shape) for t in tensors]
 
-        self.stubified[task].append(stubified)
-        self.stubs[(task, item_id)] = stubs
-
-        return item_id, [t.tensor for t in tx_list]
+        return item_id
 
     def reconstruct(self, task, item_id, tensors):
-        from smdistributed.modelparallel.torch.state_mod import state
+        for t, req in zip(tensors, self.requires_grad[(task, item_id)]):
+            t.requires_grad_(req)
 
-        for t, stub in zip(tensors, self.stubs[(task, item_id)]):
-            t.requires_grad_(stub.requires_grad)
-
-        return state.serialization_manager.deserialize(self.stubified[task][item_id], tensors)
+        return tensors
 
     def get_tensor_specs(self, task, item_id):
-        return self.stubs[(task, item_id)]
+        req, dtype, shp = (
+            self.requires_grad[(task, item_id)],
+            self.dtype[(task, item_id)],
+            self.shape[(task, item_id)],
+        )
+        return [TensorSpec(r, d, s) for r, d, s in zip(req, dtype, shp)]
 
     def reset(self):
-        self.stubified.clear()
-        self.stubs.clear()
+        self.requires_grad.clear()
+        self.dtype.clear()
+        self.shape.clear()
+        self.counts.clear()
 
 
 class TensorOffloader:
@@ -110,6 +119,20 @@ class TensorOffloader:
         # registry to keep track of wrapping objects and tensor attributes
         self.registry = OffloadRegistry()
 
+        # a queue containing (task, item_id) that are scheduled to be loaded onto GPU.
+        # the queue arrivals happen at the beginning of tasks through load() method,
+        # called by the server queue. queue drains slowly as the loaded tensors are
+        # picked up and used. this is done to keep the number of tensors occupying GPU
+        # memory limited to self.waiting_area_size.
+        self.load_queue = deque()
+
+        # the number of tensors that are loaded, and are waiting to be picked up by the framework
+        self.awaiting_pickup = 0
+
+        # the maximum number of loaded tensors that can be at the GPU memory simultaneously.
+        # we enforce self.awaiting_pick <= self.waiting_area_size.
+        self.waiting_area_size = core.cfg.activation_loading_horizon
+
     def save_for_backward(self, shard_activation_offloading, *args):
         """ Save tensors at the CPU during forward pass """
 
@@ -119,10 +142,10 @@ class TensorOffloader:
         task_id = state.exec_server.server_queue.current_task
         task = (current_task, task_id)
 
-        item_id, tensors = self.registry.put(task, args)
+        item_id = self.registry.put(task, args)
         _id = (task, item_id)
 
-        self.offload(shard_activation_offloading, _id, tensors)
+        self.offload(shard_activation_offloading, _id, args)
 
         return _id
 
@@ -149,11 +172,11 @@ class TensorOffloader:
                     torch.distributed.broadcast(t, core.tp_rank_to_rank(0), get_tp_process_group())
             else:
                 tensors = []
-                stubs = self.registry.get_tensor_specs(fwd_task_and_index, item_id)
-                for i, stub in enumerate(stubs):
+                specs = self.registry.get_tensor_specs(fwd_task_and_index, item_id)
+                for i, spec in enumerate(specs):
                     tensors.append(
                         torch.empty(
-                            *stub.shape, dtype=stub.dtype, device=torch.device("cuda", local_rank())
+                            *spec.shape, dtype=spec.dtype, device=torch.device("cuda", local_rank())
                         )
                     )
                     torch.distributed.broadcast(
@@ -242,12 +265,20 @@ class TensorOffloader:
         """
         torch.cuda.set_device(local_rank())
 
+        for item_id, tensors in reversed(self.offloaded[task].items()):
+            self.load_queue.append((task, item_id))
+
+        self._load_from_queue()
+
+    def _load_from_queue(self):
         with torch.no_grad():
             ready_event = self._record_event()
             with torch.cuda.stream(self.h2d_stream):
                 torch.cuda.current_stream().wait_event(ready_event)
-                for item_id, tensors in reversed(self.offloaded[task].items()):
+                while self.awaiting_pickup < self.waiting_area_size and len(self.load_queue) > 0:
+                    task, item_id = self.load_queue.popleft()
                     self._load(task, item_id)
+                    self.awaiting_pickup += 1
 
     def get(self, task, item_id: int):
         """
@@ -266,9 +297,13 @@ class TensorOffloader:
             with torch.cuda.stream(self.h2d_stream):
                 torch.cuda.current_stream().wait_event(ready_event)
                 self._load(task, item_id)
+            self.awaiting_pickup += 1
 
         torch.cuda.current_stream().wait_event(self.load_events[(task, item_id)])
         tensors = self.loaded.pop((task, item_id))
+        self.awaiting_pickup -= 1
+
+        self._load_from_queue()
 
         # to clear as often as possible, we also call this at the end of get
         self._clear_tensors_for_finished_offloads()
@@ -288,3 +323,5 @@ class TensorOffloader:
         self.offload_events = {}
         self.ongoing_offload_tensors = {}
         self.registry.reset()
+        self.load_queue.clear()
+        self.awaiting_pickup = 0

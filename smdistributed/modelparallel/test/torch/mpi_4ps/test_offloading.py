@@ -9,12 +9,6 @@ import torch
 
 # First Party
 import smdistributed.modelparallel.torch as smp
-from smdistributed.modelparallel.test.torch.mpi.test_backward import (
-    TestCheckpointingBase,
-    create_bert_like_model,
-    train_bert,
-    train_bert_nosmp,
-)
 from smdistributed.modelparallel.torch.offload import TensorOffloader
 from smdistributed.modelparallel.torch.server import ExecutionServer
 
@@ -43,8 +37,6 @@ def get_numel_tensors_in_memory(gpu=False):
 def train(shard_offloads=False):
     a = torch.rand(1024, 1024, device=0, requires_grad=True)
     b = torch.rand(1024, 1024, device=0, dtype=torch.float16, requires_grad=False)
-    c = (1, 2, 3)
-    d = None
     total_numel = a.numel() + b.numel()
 
     a_cpu = a.cpu()
@@ -53,7 +45,7 @@ def train(shard_offloads=False):
 
     TensorOffloader._clear_tensors_for_finished_offloads = no_clear
     offloader = TensorOffloader()
-    task, key = offloader.save_for_backward(shard_offloads, a, b, c, d)
+    task, key = offloader.save_for_backward(shard_offloads, a, b)
     time.sleep(0.01)
     del a, b
 
@@ -61,15 +53,13 @@ def train(shard_offloads=False):
         assert torch.allclose(offloader.offloaded[task][key][0], a_cpu)
         assert torch.allclose(offloader.offloaded[task][key][1], b_cpu)
 
-    a1, b1, c1, d1 = offloader.saved_tensors(shard_offloads, task, key)
+    a1, b1 = offloader.saved_tensors(shard_offloads, task, key)
 
     assert a1.numel() + b1.numel() == total_numel
     assert a1.requires_grad
     assert b1.requires_grad is False
     assert torch.allclose(a_cpu, a1.cpu())
     assert torch.allclose(b_cpu, b1.cpu())
-    assert c == c1
-    assert d == d1
 
     offloader.offloaded.clear()
     del a_cpu, b_cpu
@@ -87,7 +77,7 @@ def train(shard_offloads=False):
     assert seen_elem_cpu == 0, seen_elem_cpu
 
 
-class TestActivationOffloading(TestCheckpointingBase):
+class TestActivationOffloading(unittest.TestCase):
     def _init_smp(self, partitions=1, tp_degree=4, offload=True):
         smp.init(
             {
@@ -101,6 +91,7 @@ class TestActivationOffloading(TestCheckpointingBase):
         )
 
     def test_reference_in_memory(self, shard_offloads=False):
+        torch.manual_seed(2)
         self._init_smp()
         smp.state.exec_server = ExecutionServer()
         smp.state.exec_server.current_task = namedtuple("Task", "task_metadata dummy")

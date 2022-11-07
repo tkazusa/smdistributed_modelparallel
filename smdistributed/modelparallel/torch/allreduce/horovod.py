@@ -4,7 +4,12 @@ from horovod.torch.mpi_ops import Average, allreduce_async_, synchronize
 
 # First Party
 from smdistributed.modelparallel.torch.allreduce.reducer import GradReducer
-from smdistributed.modelparallel.torch.utils import rmsg
+from smdistributed.modelparallel.torch.exceptions import (
+    GradRequireGradError,
+    HorovodConfigError,
+    InvalidHandleError,
+    MissingGradientError,
+)
 
 
 class HorovodAllreducer(GradReducer):
@@ -39,15 +44,13 @@ class HorovodAllreducer(GradReducer):
     def _validate_hvd_config(self, horovod_config):
         supported_configs = ["compression", "op", "gradient_predivide_factor"]
         if any([k not in supported_configs for k in horovod_config.keys()]):
-            raise ValueError(
+            raise HorovodConfigError(
                 f"Only the following horovod configs are supported {supported_configs}"
             )
 
     def _allreduce_grad_async(self, name, p):
         if p.grad is None:
-            raise AssertionError(
-                rmsg(f"Param {name} has None grad although it required grad, can not allreduce it")
-            )
+            raise MissingGradientError(param_name)
 
         tensor = p.grad
         tensor_compressed, ctx = self._compression.compress(tensor)
@@ -90,9 +93,10 @@ class HorovodAllreducer(GradReducer):
                     self._handles[p] = (handle, ctx)
 
         for p, (handle, ctx) in self._handles.items():
-            assert (
-                handle is not None
-            ), "Handle should not be none, it is expected that handles only has params whose allreduce was called from the hook"
+            if handle == None:
+                raise InvalidHandleError(
+                    "Handle should not be none, it is expected that handles only has params whose allreduce was called from the hook"
+                )
             output = synchronize(handle)
             p.grad.set_(self._compression.decompress(output, ctx))
         self._handles.clear()
@@ -106,7 +110,8 @@ class HorovodAllreducer(GradReducer):
             if self.enable_grad_counting:
                 self.grad_counter.mark_grad_computed(name)
             if self.overlapping_allreduce and self._to_sync_grads:
-                assert not param.grad.requires_grad, "grad should not require grad"
+                if param.grad.requires_grad:
+                    raise GradRequireGradError
                 if self.grad_counter.is_grad_ready(name):
                     # scale grad to account for different microbatches
                     # do it here just before allreduce

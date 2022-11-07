@@ -5,6 +5,7 @@ import unittest
 import torch
 
 # First Party
+from smdistributed.modelparallel.torch.exceptions import TensorSplitError
 from smdistributed.modelparallel.torch.step import PTTensorSplitter
 
 NUM_MICROBATCHES = 4
@@ -299,7 +300,7 @@ class TestSplit(unittest.TestCase):
             {"y": torch.tensor([[4], [5]]), "z": torch.tensor([5, 6])},
             {"y": torch.tensor([[5], [6]]), "z": torch.tensor([7, 8])},
         ]
-        with self.assertRaises(ValueError):
+        with self.assertRaises(TensorSplitError):
             self._test_split(
                 args,
                 kwargs,

@@ -8,13 +8,17 @@ import torch.nn.functional as F
 
 # First Party
 import smdistributed.modelparallel.torch as smp
-from smdistributed.modelparallel.test.torch.mpi.test_backward import TestGrad
+from smdistributed.modelparallel.test.torch.model_zoo.smp_test_model import TestModel
+from smdistributed.modelparallel.test.torch.smp_test_base import SMPTestBase
 
 
-def train_nosmp_one_bwd(model, target, *args):
+def train_nosmp_one_bwd(model, optimizer, target, *args):
     output, y = model(*args)
     loss = F.nll_loss(output, target)
-    loss.backward()
+    if smp.state.cfg.fp16 and optimizer:
+        optimizer.backward(loss)
+    else:
+        loss.backward()
 
 
 @smp.step
@@ -24,10 +28,22 @@ def train_one_bwd(model, target, *args):
     model.backward(loss)
 
 
-class TestUnused(TestGrad):
+class TestUnused(SMPTestBase):
     def setUp(self):
         super(TestUnused, self).setUp()
-        self.num_microbatches = 2
+        self.smp_config = {
+            "microbatches": 2,
+            "pipeline": "interleaved",
+            "partitions": 2,
+            "auto_partition": False,
+            "default_partition": 0,
+            "offload_activations": False,
+            "_fp32_grad_accumulation": False,
+            "fp16_params": False,
+            "ddp": True,
+        }
+        self.input_sizes = [(20, 10)]
+        self.verify_loss = False
 
     def tearDown(self):
         # to remove the barrier inherited
@@ -61,9 +77,8 @@ class TestUnused(TestGrad):
                 x = self.d(x)
                 return x
 
-        x = torch.randn(self.batch_dim, 10)
-        target = torch.randint(low=0, high=3, size=(self.batch_dim,))
-        self.check_grads_and_counts(Nested, (x,), target, autopartitioning=False)
+        model = TestModel(Nested, input_sizes=self.input_sizes, smp_config=self.smp_config)
+        self.run_test([model])
 
     def test_unused_compute(self):
         # remote compute unused
@@ -93,9 +108,8 @@ class TestUnused(TestGrad):
                 x = self.d(x)
                 return x
 
-        x = torch.randn(self.batch_dim, 10)
-        target = torch.randint(low=0, high=3, size=(self.batch_dim,))
-        self.check_grads_and_counts(Nested, (x,), target, autopartitioning=False)
+        model = TestModel(Nested, input_sizes=self.input_sizes, smp_config=self.smp_config)
+        self.run_test([model])
 
     def test_unused_compute2(self):
         # local compute unused, no error
@@ -115,9 +129,8 @@ class TestUnused(TestGrad):
                 x = self.d(z)
                 return x
 
-        x = torch.randn(self.batch_dim, 10)
-        target = torch.randint(low=0, high=3, size=(self.batch_dim,))
-        self.check_grads_and_counts(Nested, (x,), target, autopartitioning=False)
+        model = TestModel(Nested, input_sizes=self.input_sizes, smp_config=self.smp_config)
+        self.run_test([model])
 
     def test_unused_compute3(self):
         # local compute unused, backward called on one output only, no error
@@ -137,15 +150,9 @@ class TestUnused(TestGrad):
                 x = self.d(z)
                 return x, y
 
-        x = torch.randn(self.batch_dim, 10)
-        target = torch.randint(low=0, high=3, size=(self.batch_dim,))
-        self.check_grads_and_counts(
-            Nested,
-            (x,),
-            target,
-            step_fns=(train_nosmp_one_bwd, train_one_bwd),
-            autopartitioning=False,
-        )
+        model = TestModel(Nested, input_sizes=self.input_sizes, smp_config=self.smp_config)
+        model.set_step_function(non_smp_func=train_nosmp_one_bwd, smp_func=train_one_bwd)
+        self.run_test([model])
 
     def test_unused_compute4(self):
         # remote compute unused, but returned as output of main module
@@ -176,21 +183,15 @@ class TestUnused(TestGrad):
                 x = self.d(x)
                 return x, y
 
-        x = torch.randn(self.batch_dim, 10)
-        target = torch.randint(low=0, high=3, size=(self.batch_dim,))
-        self.check_grads_and_counts(
-            Nested,
-            (x,),
-            target,
-            step_fns=(train_nosmp_one_bwd, train_one_bwd),
-            autopartitioning=False,
-        )
+        model = TestModel(Nested, input_sizes=self.input_sizes, smp_config=self.smp_config)
+        model.set_step_function(non_smp_func=train_nosmp_one_bwd, smp_func=train_one_bwd)
+        self.run_test([model])
 
     def test_used_compute_backward_both(self):
         # remote compute unused in rest of graph, but returned as output of main module
         # backward called on both outputs
         # of course trivial use case, but to assert that we dont fail here
-        def train_nosmp_both_bwd(model, target, *args):
+        def train_nosmp_both_bwd(model, optimizer, target, *args):
             output, y = model(*args)
             loss = F.nll_loss(output, target)
             y = y.mean()
@@ -229,15 +230,9 @@ class TestUnused(TestGrad):
                 x = self.d(x)
                 return x, y
 
-        x = torch.randn(self.batch_dim, 10)
-        target = torch.randint(low=0, high=3, size=(self.batch_dim,))
-        self.check_grads_and_counts(
-            Nested,
-            (x,),
-            target,
-            step_fns=(train_nosmp_both_bwd, train_both_bwd),
-            autopartitioning=False,
-        )
+        model = TestModel(Nested, input_sizes=self.input_sizes, smp_config=self.smp_config)
+        model.set_step_function(non_smp_func=train_nosmp_both_bwd, smp_func=train_both_bwd)
+        self.run_test([model])
 
     def test_unused_input_nograd2(self):
         # remote child produces tensor which doesn't require grad as detached
@@ -273,9 +268,8 @@ class TestUnused(TestGrad):
                 x = self.d(x)
                 return x
 
-        x = torch.randn(self.batch_dim, 10)
-        target = torch.randint(low=0, high=3, size=(self.batch_dim,))
-        self.check_grads_and_counts(Nested, (x,), target, autopartitioning=False)
+        model = TestModel(Nested, input_sizes=self.input_sizes, smp_config=self.smp_config)
+        self.run_test([model])
 
     def test_unused_input_nograd(self):
         # b output is unused but is in no_grad block so no problem
@@ -306,9 +300,8 @@ class TestUnused(TestGrad):
                 x = self.d(x)
                 return x
 
-        x = torch.randn(self.batch_dim, 10)
-        target = torch.randint(low=0, high=3, size=(self.batch_dim,))
-        self.check_grads_and_counts(Nested, (x,), target, autopartitioning=False)
+        model = TestModel(Nested, input_sizes=self.input_sizes, smp_config=self.smp_config)
+        self.run_test([model])
 
     def test_unused_input4(self):
         # remote computed y passed to local child but unused
@@ -341,9 +334,8 @@ class TestUnused(TestGrad):
                 x = self.d(x)
                 return x
 
-        x = torch.randn(self.batch_dim, 10)
-        target = torch.randint(low=0, high=3, size=(self.batch_dim,))
-        self.check_grads_and_counts(Nested, (x,), target, autopartitioning=False)
+        model = TestModel(Nested, input_sizes=self.input_sizes, smp_config=self.smp_config)
+        self.run_test([model])
 
     def test_unused_input5_detached(self):
         # remote computed y passed to local child but unused
@@ -378,9 +370,8 @@ class TestUnused(TestGrad):
                 x = self.d(x)
                 return x
 
-        x = torch.randn(self.batch_dim, 10)
-        target = torch.randint(low=0, high=3, size=(self.batch_dim,))
-        self.check_grads_and_counts(Nested, (x,), target, autopartitioning=False)
+        model = TestModel(Nested, input_sizes=self.input_sizes, smp_config=self.smp_config)
+        self.run_test([model])
 
 
 if __name__ == "__main__":

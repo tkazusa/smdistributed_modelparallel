@@ -9,9 +9,13 @@ from torch.nn import Module
 from smdistributed.modelparallel.backend.logger import get_logger
 from smdistributed.modelparallel.torch.core import pp_rank
 from smdistributed.modelparallel.torch.exceptions import (
-    InvalidExecutor,
-    MissingPathFromComputationToModuleOutput,
-    MissingPathFromModuleInputToModuleOutput,
+    CheckpointingError,
+    InvalidExecutorError,
+    InvalidParentModuleError,
+    MissingPathFromComputationToModuleOutputError,
+    MissingPathFromModuleInputToModuleOutputError,
+    SMPRuntimeError,
+    SMPUnsupportedError,
 )
 from smdistributed.modelparallel.torch.graph_utils import get_ancestors
 from smdistributed.modelparallel.torch.messages import ModuleExecutionRequest
@@ -33,6 +37,7 @@ from smdistributed.modelparallel.torch.utils import (
     check_requires_grad,
     check_supported,
     convert_args_to_device,
+    flatten_into_args,
     flatten_structure,
     flattened,
     map_structure,
@@ -54,7 +59,7 @@ def _validate_smpparents(module_name):
     if not _skip_validation_graph:
         for smpparent in smpparents:
             if smpparent.next_parent_recvs_bwd_pending <= 0:
-                raise MissingPathFromComputationToModuleOutput(
+                raise MissingPathFromComputationToModuleOutputError(
                     module_name, state.module_manager.get_module_name(smpparent.module)
                 )
 
@@ -64,7 +69,7 @@ def _validate_smpinputs(module_name):
     if not _skip_validation_graph:
         for smpinput in smpinputs:
             if smpinput.pending_smpinput_bwds <= 0:
-                raise MissingPathFromModuleInputToModuleOutput(module_name, smpinput.idx)
+                raise MissingPathFromModuleInputToModuleOutputError(module_name, smpinput.idx)
 
 
 def insert_smp_input_op(module: Module, *args: Any, **kwargs: Any):
@@ -147,9 +152,10 @@ def maybe_push_outputs(module, outputs):
         )
         increment_smp_input_bwd_counts(smp_inputs)
         _validate_smpinputs(state.module_manager.get_module_name(module))
-        state.model.grad_counter.increment_expected_num_grads(
-            state.microbatch, [state.model.get_param_name(p) for p in params]
-        )
+        if not state.cfg.zero2d_enabled():
+            state.model.grad_counter.increment_expected_num_grads(
+                state.microbatch, [state.model.get_param_name(p) for p in params]
+            )
         increment_prev_parent_recv_counts(parent_recvs)
         state.module_manager.save_smpinput_bwd_count(
             state.microbatch, position, module, parent_module, smp_inputs
@@ -210,9 +216,10 @@ def execute_as_parent(module: Module, *args: Any, **kwargs: Any):
             )
         )
         params = params.union(additional_params)
-        state.model.grad_counter.increment_expected_num_grads(
-            state.microbatch, [state.model.get_param_name(p) for p in params]
-        )
+        if not state.cfg.zero2d_enabled():
+            state.model.grad_counter.increment_expected_num_grads(
+                state.microbatch, [state.model.get_param_name(p) for p in params]
+            )
         increment_smp_input_bwd_counts(smp_inputs)
         child_output_leaves = detach_outputs(outputs)
 
@@ -253,15 +260,17 @@ def execute_as_parent(module: Module, *args: Any, **kwargs: Any):
 
 def actual_forward(module, *args, **kwargs):
     if state.checkpoint_activations_config.enabled_for_module(module) and torch.is_grad_enabled():
-        assert (
-            len(kwargs) == 0
-        ), "modules with kwargs can not be checkpointed. Dev note: Error should have been thrown before this point."
+
+        wrapping_obj, tensors = state.serialization_manager.serialize(
+            (args, kwargs), for_transmission=False
+        )
+
         outputs = CheckpointTupledFunction.apply(
             module._orig_forward,
             state.checkpoint_activations_config.preserve_rng_state,
-            state.checkpoint_activations_config.pack_args_as_tuple,
             can_shard_activation_offloading(module),
-            *args,
+            wrapping_obj,
+            *tensors,
         )
     else:
         outputs = module._orig_forward(*args, **kwargs)
@@ -300,10 +309,8 @@ def execute_module(module: Module, *args, **kwargs: Any):
                 # its module list and insert smp input op if current rank is not the
                 # executor of grand_parent
                 grand_parent, parent = state.module_manager.get_immediate_ancestors(module)
-                assert isinstance(parent, torch.nn.ModuleList), (
-                    "actual_parent should be different than module_execution_stack parent only for torch.nn.ModuleList",
-                    state.module_manager.get_module_name(parent),
-                )
+                if not isinstance(parent, torch.nn.ModuleList):
+                    raise InvalidParentModuleError(state.module_manager.get_module_name(parent))
                 if grand_parent and not state.module_manager.is_executor(grand_parent):
                     args, kwargs = insert_smp_input_op(module, *args, **kwargs)
             else:
@@ -320,19 +327,12 @@ def execute_module(module: Module, *args, **kwargs: Any):
         # only modules set with set_activation_checkpointing will match this condition
         # for calls of checkpoint and checkpoint_sequential, this context manager will already be set
         config = state.module_manager.get_checkpoint_activations_config(module)
-
-        if kwargs:
-            raise ValueError(
-                "Checkpointed module can not have kwargs, please restructure the module to take only non keyword args"
-            )
-
         outputs = checkpoint_function(
             actual_forward,
-            module,
-            *args,
+            (module,) + args,
+            kwargs,
             module_name=state.module_manager.get_module_name(module),
             preserve_rng_state=config.preserve_rng_state,
-            pack_args_as_tuple=config.pack_args_as_tuple,
         )
     else:
         outputs = actual_forward(module, *args, **kwargs)
@@ -349,9 +349,8 @@ def execute_module(module: Module, *args, **kwargs: Any):
                 # its module list and push outputs only if current rank is not the
                 # executor of grand_parent
                 grand_parent, parent = state.module_manager.get_immediate_ancestors(module)
-                assert isinstance(
-                    parent, torch.nn.ModuleList
-                ), "actual_parent should be different than module_execution_stack parent only for torch.nn.ModuleList"
+                if not isinstance(parent, torch.nn.ModuleList):
+                    raise InvalidParentModuleError(state.module_manager.get_module_name(parent))
                 if grand_parent and not state.module_manager.is_executor(grand_parent):
                     maybe_push_outputs(module, outputs)
             else:
@@ -392,7 +391,7 @@ def distributed_forward(module: Module, *args: Any, **kwargs: Any):
     elif state.module_manager.is_parent_executor(module):
         outputs = execute_as_parent(module, *args, **kwargs)
     else:
-        raise InvalidExecutor(
+        raise InvalidExecutorError(
             state.module_manager.get_module_name(module), state.module_manager.get_partition(module)
         )
     return outputs
@@ -417,9 +416,10 @@ def distributed_backward(
     )
     logger.debug(rmsg(f"{len(params)} params are reachable from final outputs"))
 
-    state.model.grad_counter.increment_expected_num_grads(
-        state.microbatch, [state.model.get_param_name(p) for p in params]
-    )
+    if not state.cfg.zero2d_enabled():
+        state.model.grad_counter.increment_expected_num_grads(
+            state.microbatch, [state.model.get_param_name(p) for p in params]
+        )
     increment_prev_parent_recv_counts(parent_recvs)
     _validate_smpparents(state.module_manager.get_module_name(mod))
 

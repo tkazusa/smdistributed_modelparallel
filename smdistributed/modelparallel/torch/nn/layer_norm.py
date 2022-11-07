@@ -15,8 +15,8 @@ from smdistributed.modelparallel.torch.smp_torch_cuda_lib import (
 
 apex_is_available = True
 try:
-    from apex.normalization.fused_layer_norm import FusedLayerNorm as ApexFusedLayerNorm
-    from apex.normalization.fused_layer_norm import MixedFusedLayerNorm as ApexMixedFusedLayerNorm
+    from smdistributed.modelparallel.torch.apex.normalization.fused_layer_norm import FusedLayerNorm as ApexFusedLayerNorm
+    from smdistributed.modelparallel.torch.apex.normalization.fused_layer_norm import MixedFusedLayerNorm as ApexMixedFusedLayerNorm
 except ImportError:
     apex_is_available = False
 

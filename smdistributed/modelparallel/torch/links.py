@@ -7,6 +7,7 @@ from typing import NamedTuple
 from smdistributed.modelparallel.backend.logger import get_logger
 from smdistributed.modelparallel.backend.utils import find_ge
 from smdistributed.modelparallel.torch.core import pp_rank
+from smdistributed.modelparallel.torch.exceptions import SMPRuntimeError
 from smdistributed.modelparallel.torch.utils import rmsg
 
 logger = get_logger()
@@ -38,7 +39,7 @@ class LinkManager:
             if len(self._available_links[matched_size]) == 0:
                 # create one with exact size if none is free
                 matched_size = None
-        except ValueError:
+        except SMPRuntimeError:
             pass
 
         if matched_size is None:

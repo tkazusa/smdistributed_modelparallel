@@ -4,6 +4,7 @@ import math
 import sysconfig
 
 # First Party
+from smdistributed.modelparallel.backend.exceptions import SMPRuntimeError
 from smdistributed.modelparallel.backend.logger import get_logger
 
 try:
@@ -12,11 +13,11 @@ except ImportError as error:
     SageMakerFileMetricsWriter = None
 
 
-class ParentException(Exception):
+class ParentException(Exception):  # pragma: no cover
     pass
 
 
-def get_divisibility_error_str(framework, batch_size, num_mb):
+def get_divisibility_error_str(framework, batch_size, num_mb):  # pragma: no cover
     if framework == "pytorch":
         last_batch_solution = "you can set drop_last=True in your DataLoader to skip this batch, or you can manually skip this batch"
     else:
@@ -25,7 +26,7 @@ def get_divisibility_error_str(framework, batch_size, num_mb):
     return f"Batch size must be divisible by the number of microbatches. Found batch size={batch_size}, number of microbatches={num_mb}. If this is the last batch of the epoch, size of the current batch might be smaller than the regular batch size you chose. If this is the case, {last_batch_solution}. If this is a tensor with no batch dimension, you can specify its argument name in 'non_split_inputs' argument to smp.step, so that smp does not attempt to split this tensor. If the batch dimension is not 0th axis, you can specify the batch axis within 'input_split_axis' argument to smp.step function. For details, visit SageMaker distributed model parallelism documentation for smp.step: https://sagemaker.readthedocs.io/en/stable/api/training/smd_model_parallel.html"
 
 
-def deprecated(alternative=None):
+def deprecated(alternative=None):  # pragma: no cover
     def deprecation_wrapper(func):
         def wrapped(*args, **kwargs):
             warn_str = f"{func.__name__} is deprecated and will be removed in a future version."
@@ -127,7 +128,7 @@ def find_ge(a, x):
     i = bisect.bisect_left(a, x)
     if i != len(a):
         return a[i]
-    raise ValueError
+    raise SMPRuntimeError
 
 
 def upload_metrics_to_studio(metrics):

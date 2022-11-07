@@ -4,6 +4,7 @@
    default: 1
    lower_bound: 1
    alias: partitions
+   description: Pipeline parallelism degree.
  tensor_parallel_degree:
    type: int
    default: 1
@@ -12,10 +13,13 @@
      ddp: True
    dependencies:
      - ddp
+   description: Tensor parallelism degree.
  microbatches:
    type: int
    default: 1
    lower_bound: 1
+   description: The number of microbatches for pipeline parallelism. The incoming batch will
+     be split into this many microbatches. The batch size must be divisible by this value.
  pipeline:
    type: str
    default: interleaved
@@ -23,9 +27,13 @@
      - simple
      - interleaved
      - _only_forward
+   description: The type of pipelining mechanism. Interleaved pipeline prioritizes backward
+     execution, while simple pipeline finishes all forward passes before moving on to backward.
+     In all known cases, interleaved pipeline should be used.
  horovod:
    type: bool
    default: False
+   description: For TensorFlow, use Horovod for data parallelism.
  ddp:
    type: bool
    default: False
@@ -33,6 +41,47 @@
      horovod: False
    dependencies:
      - horovod
+   description: Enable PyTorch DDP. Required for data and tensor parallelism.
+ sharded_data_parallel_degree:
+   type: int
+   default: 1
+   lower_bound: 1
+   requires:
+     tensor_parallel_degree: 1
+     pipeline_parallel_degree: 1
+     shard_optimizer_state: False
+   dependencies:
+     - tensor_parallel_degree
+     - pipeline_parallel_degree
+     - shard_optimizer_state
+   description: Sharded data parallelism degree based on ZeRO-2D. Will be enabled if set to larger than 1.
+ sdp_reduce_bucket_size:
+   type: int
+   default: 5e8
+   description: The size of gradient reduction buckets, in number of elements of the default dtype.
+ sdp_param_persistence_threshold:
+   type: int
+   default: 1e6
+   description: Parameters smaller than this size are not sharded; they are persisted at each GPU.
+ sdp_max_live_parameters:
+   type: int
+   default: 1e9
+   description: The maximum number of parameters that can simultaneously be in recombined state during forward and backward passes. Parameter fetching with allgather pauses when the number of active parameters reach this threshold. Increasing this parameter will increase the memory footprint, while also increasing the amount of prefetching in the parameters.
+ sdp_hierarchical_allgather:
+   type: bool
+   default: true
+   description: If set, parameter allgather is implemented hierarchically; first within each node, then across nodes. On multi-node jobs, hierarchical allgather is automatically enabled.
+ sdp_gradient_clipping:
+   type: float
+   default: 1.0
+   description: The L2 norm of gradients are clipped at this value before being applied to the parameters.
+ _sharded_data_parallelism_config:
+   type:
+     - str
+     - null
+   default: null
+   internal: true
+   description: Path to JSON file specifying ZeRO-2D config. If specified, ZeRO-2D will be enabled regardless of zero2d_sharding_degree value, and the sharding degree specified in the config (if any) will override the zero2d_sharding_degree value.
  ddp_port:
    type: int
    default: null
@@ -41,6 +90,7 @@
      ddp: True
    dependencies:
      - ddp
+   description: Port for PyTorch DDP to use for communication.
  ddp_dist_backend:
    type: str
    default: nccl
@@ -50,9 +100,11 @@
      - nccl
    dependencies:
      - ddp
+   description: PyTorch DDP backend to use.
  contiguous:
    type: bool
    default: True
+   description: On TensorFlow, forces the model subgraphs to be contiguous.
  placement_strategy:
    type: str
    default: cluster
@@ -65,12 +117,24 @@
      - DTP
      - TPD
      - TDP
+   description: Determines the mapping of model partitions onto physical devices,
+     i.e., ranking scheme. P refers to pipeline parallelism, D refers to (reduced)
+     data parallellism, and T refers to tensor parallelism. The right-most symbol
+     in the three-letter value indicates the type of parallelism the neighboring
+     ranks will perform. For instance, over 8 devices with DPT placement strategy,
+     with each type of parallelism having degree 2, TP_GROUPs will be {0, 1},
+     {2, 3}, {4, 5}, {6, 7}. PP_GROUPs will be {0, 2}, {1, 3}, {4, 6}, {5, 7}.
+     RDP_GROUPs will be {0, 4}, {1, 5}, {2, 6}, {3, 7}. cluster option is equivalent
+     to DPT, and spread is equivalent to TPD.
  optimize:
    type: str
    default: speed
    options:
      - speed
      - memory
+   description: On PyTorch, determines how DistributedTransformer will be implemented.
+     On TensorFlow, subtly changes pipeline parallelism behavior to favor memory
+     reduction vs. throughput. In almost all cases 'speed' option should be used.
  auto_partition:
    type: bool
    default: True
@@ -78,6 +142,7 @@
      default_partition: null
    dependencies:
      - default_partition
+   description: Enable auto-partitioning of modules for pipeline parallelism.
  default_partition:
    type: int
    default: null
@@ -85,6 +150,9 @@
    upper_bound: (pipeline_parallel_degree) - 1
    dependencies:
      - pipeline_parallel_degree
+   description: If auto-partition is disabled, the default partition the modules
+     (or operations, for TensorFlow) will be assigned to, unless explicitly assigned
+     to a different partition.
  prescaled_batch:
    type: bool
    default: False
@@ -92,11 +160,16 @@
      optimize: speed
    dependencies:
      - optimize
+   description: If enabled, DistributedTransformerLMHead expects each tp_rank to receive
+     the same batch, which is defined on a per-TP_GROUP basis. If disabled, each tp_rank
+     is expected to receive a different batch, defined on a per-GPU basis.
  memory_weight:
    type: float
    default: 0.8
    lower_bound: 0.0
    upper_bound: 1.0
+   description: The relative weight of memory footprint (vs. computational cost) in
+     determining the cost of a module, in auto-partitioning for pipeline parallelism.
  active_microbatches:
    type: int
    default: (pipeline_parallel_degree) + 2
@@ -105,42 +178,93 @@
    dependencies:
      - microbatches
      - pipeline_parallel_degree
+   description: The maximum number of microbatches that can be simultaneously in execution
+     in forward/backward pass. Limits the activation memory footprint.
  fast_mode:
    type: bool
    default: False
    internal: True
+   description: When forward/backward pass execution does not change from step to step,
+     speeds up pipeline parallelism by performing direct child-to-child communication
+     of tensors, instead of taking child -> parent -> child route. This is only done
+     when the next child directly consumes the output of the first child module.
  static_mode:
    type: bool
    default: False
    internal: True
+   description: When forward/backward pass execution does not change from step to step,
+     speeds up pipeline parallelism by avoiding the exchange of requests/responses, and
+     early enqueuing of recv requests.
+ fp16:
+   type: bool
+   default: False
+   description: Enable fp16 in training.
+ bf16:
+   type: bool
+   default: False
+   requires:
+     fp16: False
+     fp16_params: False
+   dependencies:
+     - fp16
+     - fp16_params
+   description: Enable bf16 in training.
  fp16_params:
    type: bool
    default: False
+   deprecated: True
+   replacement: fp16
+   description: Initialize parameters of DistributedModules in fp16.
  tensor_parallel_seed:
    type: int
    default: 0
    lower_bound: 0
+   description: Seed for the random operations in tensor-parallel distributed modules.
  offload_activations:
    type: bool
    default: False
+   description: Offload activations to CPU during forward pass, and load them back
+     to GPU during backward pass. Only functional on top of activation checkpointing.
  _shard_offloaded_activations:
    type: bool
    default: True
-   requires:
-    offload_activations: True
    internal: True
-   dependencies:
-     - offload_activations
+   description: Whenever ranks in the same TP_GROUP attempt to offload the same
+     activations, only tp_rank 0 will offload, and after loading will broadcasts
+     it to other tp_ranks. This is done to save CPU memory.
  shard_optimizer_state:
    type: bool
    default: False
+   description: Shard optimizer state across data-parallel ranks, to save memory.
+ delayed_parameter_initialization:
+   type: bool
+   default: False
+   description: Delay the parameter initialization to save CPU memory
  skip_tracing:
    type: bool
    default: False
+   description: Tracing is unconditionally skipped when enabled. Judicious choices
+     are made during partitioning in the absence of information from tracing. Can
+     be useful if tracing causes issues.
  activation_loading_horizon:
    type: int
    default: 4
+   lower_bound: 0
+   description: Defines how many layer activations can simultaneously occupy the GPU
+     (enforced across server tasks). The loading of the next activation in the queue
+     cannot start before the number of activations in the GPU awaiting consumption
+     drops below this value. Smaller values will save more memory at the cost of
+     potentially starting the activation prefetching too late.
+ task_level_activation_loading_horizon:
+   type: int
+   default: 4
    lower_bound: 1
+   internal: True
+   description: Defines how many server tasks in advance the activation loading tasks
+     will be enqueued to the offloader. A loading task being enqueued does not make any
+     guarantees on when the loading will actually happen, so it only weakly controls how
+     much in advance the loading will take place. As long as this is not too small, it
+     will have essentially no impact, and thus it is kept as an internal parameter.
  herring:
    type: bool
    default: False
@@ -151,27 +275,40 @@
      - ddp
      - horovod
    internal: True
+   description: Use herring as a data parallelism backend. Not functional yet.
  _match_weights:
    type: bool
    default: False
    internal: True
+   description: For DistributedTransformer, slices and copies the original weights to
+     the distributed ones. Useful for debugging.
  _fp32_grad_accumulation:
    type: bool
    default: False
    internal: True
-   requires:
+   requires_either:
+     fp16: True
      fp16_params: True
    dependencies:
+     - fp16
      - fp16_params
+   description: Accumulates gradients across microbatches in fp32. It might potentially
+     save memory when optimizer state sharding is NOT used and fp16 optimizer is used,
+     but this is not well-tested. The idea is to avoid storing fp16 gradients.
  checkpoint_attentions:
    type: bool
    default: False
    internal: True
+   description: Uses activation checkpointing on the attention score computation
+     in DistributedTransformer. In general this should not be used; proper activation
+     checkpointing API should be used instead.
  load_partition:
    type: bool
    default: False
    internal: True
+   description: For TensorFlow, allows for saving and loading of model partitions. Internal only.
  partition_file:
    type: str
    default: null
    internal: True
+   description: For TensorFlow, allows for saving and loading of model partitions. Internal only.

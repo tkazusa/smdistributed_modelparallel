@@ -859,11 +859,13 @@ class TestDummy(unittest.TestCase):
         dist_result = (output_dist[0].concat(), output_dist[1].concat())
         if smp.pp_rank() == 0:
             for i in range(2):
-                np.testing.assert_allclose(output[i].detach().cpu(), dist_result[i].detach().cpu())
+                np.testing.assert_allclose(
+                    output[i].detach().cpu(), dist_result[i].detach().cpu(), atol=1e-6
+                )
 
         if smp.pp_rank() == 1:
             np.testing.assert_allclose(
-                nosmp_grads.cpu(), model.module.net1.linear1.weight.grad.cpu()
+                nosmp_grads.cpu(), model.module.net1.linear1.weight.grad.cpu(), atol=1e-6
             )
 
 

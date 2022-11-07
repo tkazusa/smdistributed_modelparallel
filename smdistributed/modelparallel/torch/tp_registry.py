@@ -21,7 +21,7 @@ _SUPPORTED_TENSOR_PARALLELISM_MODULES = {
 logger = get_logger()
 
 
-def get_weight_slice(weight, partition, split_shapes=None):
+def get_weight_slice(weight, partition, split_shapes=None):  # pragma: no cover
     from smdistributed.modelparallel.torch.core import tp_rank
 
     if partition not in ["input", "output"]:
@@ -44,7 +44,7 @@ def get_weight_slice(weight, partition, split_shapes=None):
 # helpful for debugging.
 
 
-def match_weights_opt_speed(mod, dist_mod, distribute_embedding=False):
+def match_weights_opt_speed(mod, dist_mod, distribute_embedding=False):  # pragma: no cover
     from smdistributed.modelparallel.torch.core import tp_rank
 
     with torch.no_grad():
@@ -53,13 +53,11 @@ def match_weights_opt_speed(mod, dist_mod, distribute_embedding=False):
         wte, wpe, _, h, ln_f = [c for c in transformer.children()]
 
         wte_slice = get_weight_slice(wte.weight, "input")
-        wpe_slice = get_weight_slice(wpe.weight, "input")
         if distribute_embedding:
-            dist_mod.word_embedding.weight.copy_(get_weight_slice(wte.weight, "input"))
-            dist_mod.position_embedding.weight.copy_(get_weight_slice(wpe.weight, "input"))
+            dist_mod.word_embedding.weight.copy_(get_weight_slice(wte.weight, "output"))
         else:
             dist_mod.word_embedding.weight.copy_(wte.weight)
-            dist_mod.position_embedding.weight.copy_(wpe.weight)
+        dist_mod.position_embedding.weight.copy_(wpe.weight)
 
         # don't need to worry about layernorm
 
@@ -113,7 +111,7 @@ def match_weights_opt_speed(mod, dist_mod, distribute_embedding=False):
                 dc.output.dense2.bias.copy_(c.mlp.c_proj.bias)
 
 
-def match_weights_opt_memory(mod, dist_mod, distribute_embedding=False):
+def match_weights_opt_memory(mod, dist_mod, distribute_embedding=False):  # pragma: no cover
     from smdistributed.modelparallel.torch.core import tp_rank
 
     with torch.no_grad():
@@ -164,19 +162,16 @@ def match_weights_opt_memory(mod, dist_mod, distribute_embedding=False):
 
 
 class TensorParallelismRegistry:
-    def __init__(self):
-        # keyed by actual distributed module objects
-        self.forward_hooks = {}
-        self.return_hooks = {}
-
+    def __init__(self):  # pragma: no cover
         self.reset()
+        self.register_distributed_modules()
 
-    def reset(self):
+    def register_distributed_modules(self):  # pragma: no cover
         self.tp_modules = {}
-        self.module_init_args = {}
 
         # keyed by original module class
         self.init_hooks = {}
+        self.translate_functions = {}
 
         # keyed by (original module class, distributed module class)
         self._forward_hooks_per_class_pair = {}
@@ -190,6 +185,16 @@ class TensorParallelismRegistry:
         for _, mapping in self.predefined_hook_manager.all_mappings():
             self.register_with_module(*mapping)
 
+    def clear_module_init_args(self):
+        self.module_init_args = {}
+
+    def reset(self):
+        self.clear_module_init_args()
+
+        # keyed by actual distributed module objects
+        self.forward_hooks = {}
+        self.return_hooks = {}
+
     def is_supported(self, module_cls):
         return module_cls in self.tp_modules
 
@@ -197,9 +202,7 @@ class TensorParallelismRegistry:
         from smdistributed.modelparallel.torch.state_mod import state
 
         if type(module) not in self.tp_modules:
-            raise TypeError(
-                f"Modules of type {type(module)} are not supported for tensor parallelism."
-            )
+            raise UnsupportedTPModuleError(type(module))
 
         # use the recorded (args, kwargs) to create a
         # new module instance
@@ -248,6 +251,13 @@ class TensorParallelismRegistry:
                     (type(module), dist_cls)
                 ]
 
+            if (
+                type(module) in self.translate_functions
+                and self.translate_functions[type(module)] is not None
+            ):
+                state.module_manager.register_translate_function(
+                    self.translate_functions[type(module)]
+                )
             return dist_mod
         else:
             # if the module cannot be distributed with the given arguments, then do not distribute
@@ -271,9 +281,7 @@ class TensorParallelismRegistry:
 
     def register(self, dist_module, init_hook=None, forward_hook=None, return_hook=None):
         if not issubclass(dist_module, DistributedModule):
-            raise ValueError(
-                f"Can only register a sub-class of smp.nn.DistributedModule. Found {dist_module.__name__}."
-            )
+            raise TPModuleRegisterError(dist_module.__name__)
 
         def patch_module_cls_init(module_cls):
             # patch __init__ so that we track the (args, kwargs) the original module was created with
@@ -285,13 +293,18 @@ class TensorParallelismRegistry:
         return patch_module_cls_init
 
     def register_with_module(
-        self, module_cls, dist_module, init_hook=None, forward_hook=None, return_hook=None
+        self,
+        module_cls,
+        dist_module,
+        init_hook=None,
+        forward_hook=None,
+        return_hook=None,
+        translate_functions=None,
     ):
         if not issubclass(dist_module, DistributedModule):
-            raise ValueError(
-                f"Can only register a sub-class of smp.nn.DistributedModule. Found {dist_module.__name__}."
-            )
+            raise TPModuleRegisterError(dist_module.__name__)
 
         module_cls.__init__ = self.get_tracking_init(module_cls.__init__)
         self.tp_modules[module_cls] = dist_module
         self._handle_hooks(module_cls, dist_module, init_hook, forward_hook, return_hook)
+        self.translate_functions[module_cls] = translate_functions

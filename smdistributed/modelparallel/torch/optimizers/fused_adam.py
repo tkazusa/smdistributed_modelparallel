@@ -1,6 +1,6 @@
 # Third Party
 import torch
-from apex.optimizers import FusedAdam as ApexFusedAdam
+from smdistributed.modelparallel.torch.apex.optimizers import FusedAdam as ApexFusedAdam
 
 # First Party
 from smdistributed.modelparallel.torch import local_rank

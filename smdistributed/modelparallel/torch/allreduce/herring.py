@@ -1,6 +1,7 @@
 # First Party
 from smdistributed.modelparallel.backend.logger import get_logger
 from smdistributed.modelparallel.torch.allreduce.reducer import GradReducer
+from smdistributed.modelparallel.torch.exceptions import InvalidHandleError, SMPUnsupportedError
 
 logger = get_logger()
 
@@ -31,11 +32,11 @@ class HerringAllreducer(GradReducer):
         for n, p in self.named_parameters.items():
             # will return local parameters
             # init fusion buffers
-            raise NotImplementedError
+            raise SMPUnsupportedError
 
     def _allreduce_grad_async(self, p):
         # handle = herring.allreduce()
-        raise NotImplementedError
+        raise SMPUnsupportedError
         return handle
 
     def _synchronize_internal(self):
@@ -59,9 +60,10 @@ class HerringAllreducer(GradReducer):
 
         size = float(dist.get_world_size())
         for p, (handle, ctx) in self._handles.items():
-            assert (
-                handle is not None
-            ), "Handle should not be none, it is expected that handles only has params whose allreduce was called from the hook"
+            if handle == None:
+                raise InvalidHandleError(
+                    "Handle should not be none, it is expected that handles only has params whose allreduce was called from the hook"
+                )
             handle.wait()
             p.grad.data /= size
         self._handles.clear()

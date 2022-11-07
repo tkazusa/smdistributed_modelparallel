@@ -11,6 +11,12 @@ import torch
 # First Party
 from smdistributed.modelparallel.backend.logger import get_logger
 from smdistributed.modelparallel.torch.core import core, rank
+from smdistributed.modelparallel.torch.exceptions import (
+    NonDummyTensorError,
+    NotSupportedByFastModeError,
+    RecursionDepthExceededDuringSerializationError,
+    SMPRuntimeError,
+)
 from smdistributed.modelparallel.torch.module_manager import TensorModuleInfo
 from smdistributed.modelparallel.torch.utils import (
     get_tensor_size,
@@ -77,9 +83,8 @@ class DummyTensorRegistry:
 
     def _add_hook(self, tensor):
         if tensor.requires_grad:
-            assert (
-                hasattr(tensor, "_smp_is_dummy") and tensor._smp_is_dummy
-            ), "Attempt to add error hook to non-dummy tensor."
+            if not (hasattr(tensor, "_smp_is_dummy") and tensor._smp_is_dummy):
+                raise NonDummyTensorError("add error hook")
 
             # add a hook to raise an error if tensor is used in backward pass, which would
             # imply that it has been used in forward pass too. when we actually need to call
@@ -87,9 +92,7 @@ class DummyTensorRegistry:
             # until we hit SMPParentRecvBackward, and then remove the hook so backward pass
             # can continue.
             def raise_error(x):
-                raise RuntimeError(
-                    "Model is not supported by fast mode, please set 'fast_mode' to False."
-                )
+                raise NotSupportedByFastModeError
 
             handle = tensor.register_hook(lambda x: raise_error(x))
             self._handles[id(tensor)] = handle
@@ -100,7 +103,8 @@ class DummyTensorRegistry:
             del self._handles[id(tensor)]
 
     def put(self, tensor, stub):
-        assert hasattr(tensor, "_smp_is_dummy") and tensor._smp_is_dummy
+        if not (hasattr(tensor, "_smp_is_dummy") and tensor._smp_is_dummy):
+            raise NonDummyTensorError("put")
         get_logger().debug(
             rmsg(f"Saving dummy tensor with id {id(tensor)} for link {stub.link_id}")
         )
@@ -109,7 +113,8 @@ class DummyTensorRegistry:
         self._add_hook(tensor)
 
     def get(self, tensor):
-        assert hasattr(tensor, "_smp_is_dummy") and tensor._smp_is_dummy
+        if not (hasattr(tensor, "_smp_is_dummy") and tensor._smp_is_dummy):
+            raise NonDummyTensorError("get")
 
         get_logger().debug(rmsg(f"Fetching dummy tensor with id {id(tensor)}"))
         return self._registry[id(tensor)]
@@ -145,9 +150,7 @@ class SerializationManager:
             ):
                 # make sure there are no operations (in-place or otherwise) inserted on the dummy at the parent
                 if self._has_ops_on_dummy(tensor):
-                    raise RuntimeError(
-                        "Model is not supported by fast mode, please set 'fast_mode' to False."
-                    )
+                    raise NotSupportedByFastModeError
                 self.dummy_registry.remove_hook(tensor)
 
         return map_structure(_remove_hook, tensors)
@@ -179,15 +182,21 @@ class SerializationManager:
         try:
             yield
         except RecursionError:
-            raise RuntimeError(
-                f"Recursion depth exceeded while serializing object of type {obj.__class__.__name__}. This is probably caused by a large, non-Tensor object being passed as an argument to a module, or being returned from a module or smp.step."
-            )
+            raise RecursionDepthExceededDuringSerializationError(obj.__class__.__name__)
 
-    def serialize(self, obj: Any, c2c_possible: bool, peers: List[int], for_offload: bool = False):
+    def serialize(
+        self,
+        obj: Any,
+        c2c_possible: bool = False,
+        peers: List[int] = None,
+        for_transmission: bool = True,
+        return_stub_list: bool = False,
+    ):
         tx_list = []
+        stub_list = []
         with self.catch_and_raise_for_large_object(obj):
             obj_stripped_of_tensors, seen_class_types = self._replace_tensors_with_stubs(
-                obj, {}, tx_list, c2c_possible, peers, for_offload
+                obj, {}, tx_list, stub_list, c2c_possible, peers, for_transmission
             )
 
             # the above will mutate the class types in-place, so if we have encountered any non-Tensor
@@ -195,10 +204,18 @@ class SerializationManager:
             # the original object locally
             if seen_class_types:
                 serialized_cpy = copy.deepcopy(obj_stripped_of_tensors)
-                self.deserialize(obj_stripped_of_tensors, [t.tensor for t in tx_list])
-                return serialized_cpy, tx_list
+                tensors = [t.tensor for t in tx_list] if for_transmission else tx_list
+                self.deserialize(obj_stripped_of_tensors, tensors)
+
+                if return_stub_list:
+                    return serialized_cpy, tx_list, stub_list
+                else:
+                    return serialized_cpy, tx_list
             else:
-                return obj_stripped_of_tensors, tx_list
+                if return_stub_list:
+                    return obj_stripped_of_tensors, tx_list, stub_list
+                else:
+                    return obj_stripped_of_tensors, tx_list
 
     def deserialize(self, stubbed_obj, tensors: List[torch.Tensor]):
         def replace_tensor(stub, tensor_list):
@@ -221,7 +238,7 @@ class SerializationManager:
         if isinstance(obj, TensorStub):
             return callback(obj, tensor_list)
 
-        if isinstance(obj, (bool, str, bytes, bytearray, int, float, Enum)):
+        if isinstance(obj, (bool, str, bytes, bytearray, int, float, Enum, type(None))):
             return obj
 
         if isinstance(obj, (list, tuple, set)):
@@ -268,14 +285,15 @@ class SerializationManager:
         obj,
         memo: Dict,
         tx_list: List[TensorTransmission],
+        stub_list: List[TensorStub],
         c2c_possible: bool,
         peers: List[int],
-        for_offload: bool = False,
+        for_transmission: bool = True,
     ):
         if id(obj) in memo:
             return memo[id(obj)], False
 
-        if isinstance(obj, (bool, str, bytes, bytearray, int, float, Enum)):
+        if isinstance(obj, (bool, str, bytes, bytearray, int, float, Enum, type(None))):
             return obj, False
 
         if isinstance(obj, (list, tuple, set)):
@@ -283,7 +301,7 @@ class SerializationManager:
             seen_class_type = False
             for item in obj:
                 res, ret_seen_cls_type = self._replace_tensors_with_stubs(
-                    item, memo, tx_list, c2c_possible, peers, for_offload
+                    item, memo, tx_list, stub_list, c2c_possible, peers, for_transmission
                 )
                 seen_class_type = seen_class_type or ret_seen_cls_type
                 l.append(res)
@@ -309,11 +327,11 @@ class SerializationManager:
             seen_class_type = False
             for k, v in obj.items():
                 stub_key, ret_seen_cls_type_key = self._replace_tensors_with_stubs(
-                    k, memo, tx_list, c2c_possible, peers, for_offload
+                    k, memo, tx_list, stub_list, c2c_possible, peers, for_transmission
                 )
                 memo[id(k)] = stub_key
                 stub_value, ret_seen_cls_type_value = self._replace_tensors_with_stubs(
-                    v, memo, tx_list, c2c_possible, peers, for_offload
+                    v, memo, tx_list, stub_list, c2c_possible, peers, for_transmission
                 )
                 seen_class_type = (
                     seen_class_type or ret_seen_cls_type_key or ret_seen_cls_type_value
@@ -325,9 +343,10 @@ class SerializationManager:
 
         if isinstance(obj, torch.Tensor):
             stub, transmission = self._stubify_tensor(
-                obj, len(tx_list), c2c_possible, peers, for_offload
+                obj, len(tx_list), c2c_possible, peers, for_transmission
             )
             tx_list.append(transmission)
+            stub_list.append(stub)
             memo[id(obj)] = stub
             return stub, False
 
@@ -336,14 +355,14 @@ class SerializationManager:
             obj_attr = getattr(obj, attr)
             if not callable(obj_attr) and not attr.startswith("__"):
                 value, _ = self._replace_tensors_with_stubs(
-                    obj_attr, memo, tx_list, c2c_possible, peers, for_offload
+                    obj_attr, memo, tx_list, stub_list, c2c_possible, peers, for_transmission
                 )
                 setattr(obj, attr, value)
                 memo[id(obj_attr)] = value
         memo[id(obj)] = obj
         return obj, True
 
-    def _stubify_tensor(self, tensor, index, c2c_possible, peers, for_offload=False):
+    def _stubify_tensor(self, tensor, index, c2c_possible, peers, for_transmission=True):
         """
         Algorithm:
             - If the input tensor is dummy:
@@ -390,7 +409,8 @@ class SerializationManager:
             # tensor.requires_grad is not a hard requirement, but if requires_grad is False
             # we cannot detect that a dummy tensor is being used in parent and raise error
 
-            assert len(peers) == 1, "Should not come here for broadcast communication"
+            if len(peers) != 1:
+                raise SMPRuntimeError("Should not come here for broadcast communication")
 
             module_info = tensor._smp_module_info
             if state.current_step_func().has_direct_consumers(module_info):
@@ -406,7 +426,7 @@ class SerializationManager:
         module_info = tensor._smp_module_info if hasattr(tensor, "_smp_module_info") else None
         src = rank()
 
-        if for_offload:
+        if not for_transmission:
             link_id = None
         else:
             # (Warning!) The self.tensor_index_to_link_id is controlled by the ServerCommunicator
@@ -420,9 +440,10 @@ class SerializationManager:
                     )
                 )
             else:
-                assert (
-                    not state.skip_metadata_transmission()
-                ), "Skip_metadata_transmission is True but tensor_index_to_link_id is None!"
+                if state.skip_metadata_transmission():
+                    raise SMPRuntimeError(
+                        "Skip_metadata_transmission is True but tensor_index_to_link_id is None!"
+                    )
                 link_id = state.link_manager.get_link(get_tensor_size(tensor))
                 get_logger().debug(
                     rmsg(
@@ -445,6 +466,8 @@ class SerializationManager:
             link_id,
             module_info,
         )
-        transmission = TensorTransmission(tensor, dests, link_id)
 
-        return stub, transmission
+        if for_transmission:
+            return stub, TensorTransmission(tensor, dests, link_id)
+        else:
+            return stub, tensor

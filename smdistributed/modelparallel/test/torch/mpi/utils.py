@@ -18,12 +18,15 @@ def create_bert_like_model(
     checkpoint_style="regular",
 ):
     class BertForPreTraining(nn.Module):
-        def __init__(self, use_sequential=False, activation_checkpointing=False):
+        def __init__(
+            self, use_sequential=False, activation_checkpointing=False, torch_api=torch_api
+        ):
             super(BertForPreTraining, self).__init__()
             self.activation_checkpointing = activation_checkpointing
             self.use_sequential = use_sequential
+            self.torch_api = torch_api
 
-            self.bert = BertModel(use_sequential, activation_checkpointing)
+            self.bert = BertModel(use_sequential, activation_checkpointing, torch_api)
             self.cls = BertPreTrainingHeads(self.bert.embeddings.word_embeddings.weight)
 
         @property
@@ -67,10 +70,11 @@ def create_bert_like_model(
             return prediction_scores, seq_relationship_score
 
     class BertModel(nn.Module):
-        def __init__(self, use_sequential=False, activation_checkpointing=False):
+        def __init__(self, use_sequential=False, activation_checkpointing=False, torch_api=True):
             super(BertModel, self).__init__()
             self.activation_checkpointing = activation_checkpointing
             self.use_sequential = use_sequential
+            self.torch_api = torch_api
 
             self.embeddings = BertEmbeddings()
             if self.use_sequential:
@@ -82,27 +86,23 @@ def create_bert_like_model(
         def forward(self, x, y, z):
             a = self.embeddings(x, y)
 
-            if self.activation_checkpointing and self.use_sequential and torch_api:
+            if self.activation_checkpointing and self.use_sequential and self.torch_api:
                 if smp.state.model is None:
 
                     if checkpoint_style == "regular":
                         b, _ = checkpoint_sequential_original(self.encoder, 1, (a, z))
                     elif checkpoint_style == "non_sequential":
-                        # original  doesn't support pack_args_as_tuple so just run without ckpting
                         b, _ = self.encoder((a, z))
                 else:
                     assert isinstance(self.encoder, nn.Sequential)
                     if checkpoint_style == "regular":
-                        b, _ = checkpoint_sequential(
-                            self.encoder, (a, z), strategy=strategy, pack_args_as_tuple=True
-                        )
+                        b, _ = checkpoint_sequential(self.encoder, (a, z), strategy=strategy)
                     elif checkpoint_style == "non_sequential":
-                        # if we actually try to checkpoint this module, it would crash as pack_args_as_tuple is not set
                         b, _ = checkpoint(self.encoder, (a, z))
             else:
                 b, _ = self.encoder((a, z))
 
-            if self.activation_checkpointing and not self.use_sequential and torch_api:
+            if self.activation_checkpointing and not self.use_sequential and self.torch_api:
                 if smp.state.model is not None:
                     c = checkpoint(self.pooler, b)
                 else:

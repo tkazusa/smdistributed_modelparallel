@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn
 
 # First Party
+from smdistributed.modelparallel.torch.exceptions import CustomSoftmaxKernelDtypeError
 from smdistributed.modelparallel.torch.smp_torch_cuda_lib import (
     scaled_masked_softmax_backward,
     scaled_masked_softmax_forward,
@@ -20,9 +21,7 @@ class ScaledMaskedSoftmax(nn.Module):
 
     def forward(self, inp, mask):
         if inp.dtype not in [torch.float16, torch.bfloat16]:
-            raise TypeError(
-                "Fused softmax kernel can only be used with float16 or bfloat16 dtypes."
-            )
+            raise CustomSoftmaxKernelDtypeError
 
         return FusedScaledMaskedSoftmax.apply(inp, mask, self.scale)
 
@@ -36,9 +35,7 @@ class ScaledCausalMaskedSoftmax(nn.Module):
 
     def forward(self, inp):
         if inp.dtype not in [torch.float16, torch.bfloat16]:
-            raise TypeError(
-                "Fused softmax kernel can only be used with float16 or bfloat16 dtypes."
-            )
+            raise CustomSoftmaxKernelDtypeError
 
         b, np, sq, sk = inp.size()
         inp = inp.view(-1, sq, sk)

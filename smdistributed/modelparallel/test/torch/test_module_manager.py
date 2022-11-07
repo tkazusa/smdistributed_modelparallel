@@ -9,6 +9,7 @@ from torch.autograd import set_grad_enabled
 # First Party
 import smdistributed.modelparallel.torch as smp
 from smdistributed.modelparallel.test.torch.utils import Net1, Net2
+from smdistributed.modelparallel.torch.exceptions import DistributedModelNotWrappedError
 from smdistributed.modelparallel.torch.patches.tracing import TracingEnd
 from smdistributed.modelparallel.torch.state_mod import state
 from smdistributed.modelparallel.torch.step import step
@@ -319,7 +320,7 @@ class TestModuleManager(unittest.TestCase):
     def test_activation_checkpointing(self):
         smp.init({"partitions": 1})
         m = nn.Linear(4, 4)
-        with self.assertRaises(RuntimeError):
+        with self.assertRaises(DistributedModelNotWrappedError):
             smp.set_activation_checkpointing(m)
 
 

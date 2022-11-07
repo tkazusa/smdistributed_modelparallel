@@ -19,8 +19,11 @@ from smdistributed.modelparallel.test.torch.mpi_4ps.utils import LinearActivatio
 from smdistributed.modelparallel.torch.nn.utils import get_local_channels, get_start_pos_for_slicing
 from smdistributed.modelparallel.torch.tp_registry import get_weight_slice
 
-ATOL = 1e-5
+# Adjusted ATOL for PT1.11 tests on P4 Instances 
+ATOL = 5e-3
 RTOL = 1e-4
+CHECKPOINT_ATOL = 1e-8
+CHECKPOINT_RTOL = 1e-8
 
 FLOAT_TYPES = (torch.FloatTensor, torch.cuda.FloatTensor)
 HALF_TYPES = (torch.HalfTensor, torch.cuda.HalfTensor)
@@ -35,9 +38,12 @@ except ImportError:
 
 def conversion_helper(val, conversion):
     """Apply conversion to val. Recursively apply conversion if `val` is a nested tuple/list structure."""
-    if not isinstance(val, (tuple, list)):
+    if not isinstance(val, (tuple, list, dict)):
         return conversion(val)
-    rtn = [conversion_helper(v, conversion) for v in val]
+    if isinstance(val, dict):
+        rtn = {k:conversion_helper(v, conversion) for k,v in val.items()}
+    else:
+        rtn = [conversion_helper(v, conversion) for v in val]
     if isinstance(val, tuple):
         rtn = tuple(rtn)
     return rtn
@@ -77,7 +83,7 @@ class FP16_Module(nn.Module):
         self.add_module("module", module.half())
 
     def forward(self, *inputs, **kwargs):
-        return fp16_to_fp32(self.module(*(fp32_to_fp16(inputs)), **kwargs))
+        return fp16_to_fp32(self.module(*(fp32_to_fp16(inputs)), **(fp32_to_fp16(kwargs))))
 
     def state_dict(self, destination=None, prefix="", keep_vars=False):
         return self.module.state_dict(destination, prefix, keep_vars)
@@ -121,12 +127,17 @@ def slice_and_compare_grads(module, dist_module, partition=None, split_shapes=No
         assert torch.allclose(module.bias.grad, dist_module.bias.grad, atol=atol)
 
 
-def equalize_embedding_weights(module, dist_module, split=True):
+def equalize_embedding_weights(module, dist_module, split=True, vocab_parallel=False):
     with torch.no_grad():
         if split:
-            slice_size = get_local_channels(module.embedding_dim)
-            start = get_start_pos_for_slicing(module.embedding_dim)
-            weight_slice = module.weight.clone().narrow(-1, start, slice_size).contiguous()
+            if vocab_parallel:
+                slice_size = get_local_channels(module.num_embeddings)
+                start = get_start_pos_for_slicing(module.num_embeddings)
+                weight_slice = module.weight.clone().narrow(0, start, slice_size).contiguous()
+            else:
+                slice_size = get_local_channels(module.embedding_dim)
+                start = get_start_pos_for_slicing(module.embedding_dim)
+                weight_slice = module.weight.clone().narrow(-1, start, slice_size).contiguous()
         else:
             weight_slice = module.weight
         dist_module.weight.copy_(weight_slice)

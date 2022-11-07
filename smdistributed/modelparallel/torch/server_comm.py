@@ -14,6 +14,7 @@ from smdistributed.modelparallel.backend.collectives import TransactionIdentifie
 from smdistributed.modelparallel.backend.logger import get_logger
 from smdistributed.modelparallel.torch import smplib
 from smdistributed.modelparallel.torch.core import core, local_rank, pp_rank, rank
+from smdistributed.modelparallel.torch.exceptions import SMPRuntimeError
 from smdistributed.modelparallel.torch.messages import (
     ForwardExecutionResult,
     MicrobatchEndResult,
@@ -118,10 +119,11 @@ class ServerCommunicator:
         """
         if state.skip_metadata_transmission():
             msg_meta = self._get_stubmsg_meta(message)
-            assert (
+            if not (
                 msg_meta in self.minibatch_msg_meta_to_link_id
                 and len(self.minibatch_msg_meta_to_link_id[msg_meta]) > 0
-            ), rmsg(f"message {message} is not recorded properly!")
+            ):
+                raise SMPRuntimeError(rmsg(f"message {message} is not recorded properly!"))
             tensor_index_to_link_id = self.minibatch_msg_meta_to_link_id[msg_meta].pop()
             state.serialization_manager.tensor_index_to_link_id = tensor_index_to_link_id
             logger.debug(
@@ -193,7 +195,8 @@ class ServerCommunicator:
             return None
 
         # at this point self.has_message() must have returned True, so self.ready_messages cannot be empty
-        assert len(self.ready_messages) > 0, "has_message returned True, but no ready messages"
+        if len(self.ready_messages) <= 0:
+            raise SMPRuntimeError("has_message returned True, but no ready messages")
 
         stubbed_msg, stubs = self.ready_messages.popleft()
         if hasattr(stubbed_msg, "mb"):
@@ -306,9 +309,8 @@ class ServerCommunicator:
     def cache_tensor(self, link_id, tensor):
         """ Cache tensor if the next consumer is in the same rank. """
 
-        assert hasattr(
-            tensor, "_smp_module_info"
-        ), "Attempt to locally cache tensor without module info attribute"
+        if not hasattr(tensor, "_smp_module_info"):
+            raise SMPRuntimeError("Attempt to locally cache tensor without module info attribute")
 
         module_info = tensor._smp_module_info
         self._local_tensor_cache[link_id] = tensor
@@ -317,7 +319,8 @@ class ServerCommunicator:
 
     def fetch_tensor(self, link_id):
         """ Get tensor that is locally cached. """
-        assert link_id in self._local_tensor_cache, "Cannot find tensor in local cache."
+        if not link_id in self._local_tensor_cache:
+            raise SMPRuntimeError("Cannot find tensor in local cache.")
 
         tensor = self._local_tensor_cache[link_id].detach()
 
@@ -332,7 +335,8 @@ class ServerCommunicator:
 
     def _check_tensor(self, stub):
         if stub.src == rank():
-            assert stub.link_id in self._local_tensor_cache, "Cannot find tensor in local cache."
+            if not stub.link_id in self._local_tensor_cache:
+                raise SMPRuntimeError("Cannot find tensor in local cache.")
             return True
 
         return smplib.smp_torch_check_tensor(stub.src, stub.link_id)
@@ -344,5 +348,6 @@ class ServerCommunicator:
         t = smplib.smp_torch_get_tensor(stub.src, stub.link_id)
 
         logger.debug(rmsg(f"Picking up tensor with (src, link_id)=({stub.src}, {stub.link_id})"))
-        assert t is not None, "Retrieved tensor is None."
+        if t == None:
+            raise SMPRuntimeError("Retrieved tensor is None.")
         return t

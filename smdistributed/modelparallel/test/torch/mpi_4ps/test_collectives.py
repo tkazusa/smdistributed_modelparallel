@@ -113,6 +113,13 @@ class TestPTCollectives(unittest.TestCase):
 
         self.verify_scatter_and_merge(tensors, split_axis, merge_axis, expected)
 
+    def test_allgather_cpu(self):
+        smp.init({"partitions": 1, "ddp": True})
+        tensors = [r * torch.ones(16) for r in range(smp.dp_size())]
+        result = smp.allgather(tensors[smp.dp_rank()].cpu(), group=smp.DP_GROUP)
+        for item1, item2 in zip(result, tensors):
+            self.assertTrue(torch.all(item1.eq(item2)))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,0 +1,3 @@
+amp_C
+fused_layer_norm_cuda
+smdistributed

@@ -81,9 +81,11 @@ class TestModuleReuseHigh(unittest.TestCase):
         output_dist = train_step(model, x, out_grads)
         dist_result = output_dist.concat()
         if smp.pp_rank() == 0:
-            np.testing.assert_allclose(output.detach().cpu(), dist_result.detach().cpu())
+            np.testing.assert_allclose(output.detach().cpu(), dist_result.detach().cpu(), atol=1e-6)
         if smp.pp_rank() == 1:
-            np.testing.assert_allclose(nosmp_grads.cpu(), model.module.linear3.weight.grad.cpu())
+            np.testing.assert_allclose(
+                nosmp_grads.cpu(), model.module.linear3.weight.grad.cpu(), atol=1e-6
+            )
 
     def test_module_reuse_high(self):
         @smp.step
@@ -168,11 +170,13 @@ class TestModuleReuseHigh(unittest.TestCase):
         output_dist = train_step(model, x, y, out_grads)
 
         if smp.pp_rank() == 0:
-            np.testing.assert_allclose(output.detach().cpu(), output_dist.outputs[0].detach().cpu())
+            np.testing.assert_allclose(
+                output.detach().cpu(), output_dist.outputs[0].detach().cpu(), atol=1e-6
+            )
 
         if smp.pp_rank() == 3:
             np.testing.assert_allclose(
-                nosmp_grads.cpu(), model.module.net2.net3.linear1.weight.grad.cpu()
+                nosmp_grads.cpu(), model.module.net2.net3.linear1.weight.grad.cpu(), atol=1e-6
             )
 
 

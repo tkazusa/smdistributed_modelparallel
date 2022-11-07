@@ -6,6 +6,11 @@ from enum import Enum
 from functools import lru_cache
 
 # First Party
+from smdistributed.modelparallel.backend.exceptions import (
+    InvalidEnvironmentError,
+    NotInitializedError,
+    WorkerSizeError,
+)
 from smdistributed.modelparallel.backend.logger import get_logger
 
 logger = get_logger()
@@ -206,15 +211,15 @@ class ModelParallelCore:
         pp_size = self.pp_size()
         tp_size = self.tp_size()
         if pp_size * tp_size > world_size:
-            raise ValueError(
+            raise WorkerSizeError(
                 f"The number of processes must be at least the product of the specified pipeline parallelism and tensor parallelism degrees ({pp_size * tp_size})."
             )
         if world_size % (pp_size * tp_size) != 0:
-            raise ValueError(
+            raise WorkerSizeError(
                 f"The number of processes must be an integer multiple of the product of the specified pipeline parallelism and tensor parallelism degrees ({pp_size * tp_size})."
             )
         if world_size // (pp_size * tp_size) > 1 and not (self.cfg.horovod or self.cfg.ddp):
-            raise ValueError(
+            raise WorkerSizeError(
                 f"If the number of processes is larger than the the product of the specified pipeline parallelism and tensor parallelism degrees ({pp_size * tp_size}), "
                 + f"then 'horovod':True (for TensorFlow) or 'ddp':True (for PyTorch) must be specified. Passed configurations are {self.cfg._input_config}."
             )
@@ -254,10 +259,10 @@ class ModelParallelCore:
             atexit.register(self.shutdown)
 
         if status_code == InitStatus.BAD_ENV.value:
-            raise RuntimeError("SageMaker environment not found")
+            raise InvalidEnvironmentError("SageMaker environment not found")
         elif status_code == InitStatus.LOW_DEVICE_COUNT.value:
-            raise RuntimeError(
-                f"The number of node-local MPI processes {self.lib.smp_local_size()}"
+            raise WorkerSizeError(
+                f"The number of node-local MPI processes {self.lib.smp_local_size()} "
                 f"cannot be larger than the device count {self.lib.smp_device_count()}"
             )
         elif status_code != InitStatus.GOOD.value:
@@ -266,11 +271,13 @@ class ModelParallelCore:
             # backend needs to be modified so that initialization of MPI and/or threads
             # does not happen multiple times.
             # This does not matter for the current errors as it does not make sense to retry them.
-            raise RuntimeError("Initialization failed")
+            raise InitializationErrors("Initialization failed")
 
         self.ranker = Ranker(
             self.cfg.placement_strategy, self.rdp_size(), self.pp_size(), self.tp_size()
         )
+
+        self.cfg.construct_zero2d_config_dict(self)
 
         # needs to run after shutdown hook is registered
         self._validate_worker_size()
@@ -284,7 +291,7 @@ class ModelParallelCore:
 
     def _validate_initialized(self):
         if not self.initialized:
-            raise RuntimeError("smp is not initialized!")
+            raise NotInitializedError
 
     @lru_cache(maxsize=1)
     def rank(self):
@@ -541,3 +548,15 @@ class ModelParallelCore:
 
         self.lib.smp_get_and_reset_memory_metrics.restype = SmpMemoryStats
         return self.lib.smp_get_and_reset_memory_metrics()
+
+    def get_and_reset_alloc_stats(self):
+        """Get D2D allocation metrics (success and failure counts)"""
+
+        class SmpAllocStats(ctypes.Structure):
+            _fields_ = [
+                ("backend_d2d_success_allocated", ctypes.c_ulonglong),
+                ("backend_d2d_failure_allocated", ctypes.c_ulonglong),
+            ]
+
+        self.lib.smp_get_and_reset_alloc_metrics.restype = SmpAllocStats
+        return self.lib.smp_get_and_reset_alloc_metrics()

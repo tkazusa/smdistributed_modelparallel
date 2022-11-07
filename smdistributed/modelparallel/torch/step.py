@@ -23,8 +23,12 @@ from smdistributed.modelparallel.backend.utils import (
     get_divisibility_error_str,
     upload_metrics_to_studio,
 )
-from smdistributed.modelparallel.torch.comm import pp_barrier
 from smdistributed.modelparallel.torch.core import dp_rank, pp_rank, rank, tp_rank
+from smdistributed.modelparallel.torch.exceptions import (
+    NotSupportedByFastModeError,
+    SMPRuntimeError,
+    TensorSplitError,
+)
 from smdistributed.modelparallel.torch.module_manager import TensorModuleInfo
 from smdistributed.modelparallel.torch.state_mod import state
 from smdistributed.modelparallel.torch.utils import check_env_var_truthy, map_structure, rmsg
@@ -56,7 +60,7 @@ class PTTensorSplitter(TensorSplitter):
     def slice(self, tensor, num_mb, mb, axis=0):
         dim_size = list(tensor.size())[axis]
         if dim_size % num_mb != 0:
-            raise ValueError(get_divisibility_error_str("pytorch", dim_size, num_mb))
+            raise TensorSplitError(get_divisibility_error_str("pytorch", dim_size, num_mb))
 
         split_size = dim_size // num_mb
         return tensor.narrow(axis, mb * split_size, split_size)
@@ -157,7 +161,10 @@ class StepFunction:
         TensorModuleInfo, and maps into (module_name, count) pairs, where
         count is how many times this module was executed before. """
 
-        assert state.microbatch == 0
+        if state.microbatch != 0:
+            raise SMPRuntimeError(
+                f"update_direct_fwd_consumers should run on mb 0, instead getting {state.microbatch}"
+            )
 
         module_name = state.module_manager.get_module_name(module)
         if start_index:
@@ -182,16 +189,20 @@ class StepFunction:
                     if state.current_minibatch() == 0:
                         self._direct_consumers[arg._smp_module_info].append((module_name, count))
                     elif state.cfg.fast_mode:
-                        raise RuntimeError(
-                            "A change in model graph is detected. Graph changes are not supported in fast mode, please set 'fast_mode' to False."
-                        )
+                        raise NotSupportedByFastModeError(graph_change=True)
 
     def update_direct_bwd_consumers(self, grads, module):
-        assert state.microbatch == 0
+        if state.microbatch != 0:
+            raise SMPRuntimeError(
+                f"update_direct_bwd_consumers should run on mb 0, instead getting {state.microbatch}"
+            )
 
         for grad in grads:
             if grad is not None:
-                assert isinstance(grad, torch.Tensor)
+                if not isinstance(grad, torch.Tensor):
+                    raise SMPRuntimeError(
+                        f"grad should be a torch.Tensor, but getting {type(grad)}"
+                    )
                 if hasattr(grad, "_smp_module_info"):
                     module_name = state.module_manager.get_module_name(module)
                     count = self.get_bwd_module_execution_count(module, 0)
@@ -252,7 +263,8 @@ class StepFunction:
                 state.exec_server.run_step_follower()
 
         # ensures all ranks finish a step together so they dont interfere with each other
-        pp_barrier()
+        # moved this barrier to post model.step
+        # pp_barrier()
 
         state.core.timeline_end_step()
         self._upload_metrics_once()

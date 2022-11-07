@@ -1,6 +1,6 @@
 # Third Party
 import torch
-from apex.optimizers import FusedNovoGrad as ApexFusedNovoGrad
+from smdistributed.modelparallel.torch.apex.optimizers import FusedNovoGrad as ApexFusedNovoGrad
 
 # First Party
 from smdistributed.modelparallel.torch.core import local_rank

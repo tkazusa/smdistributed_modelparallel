@@ -281,7 +281,10 @@ class TestDistributedOps(unittest.TestCase):
                 torch.allclose(lin.bias.grad.cpu(), dist_lin.bias.grad.cpu(), atol=ATOL)
             )
 
-    def test_dist_embedding(self, embedding_dim=1024):
+    def test_dist_embedding_emb_dim(self, embedding_dim=1024):
+        self.test_dist_embedding(embedding_dim, vocab_parallel=False)
+
+    def test_dist_embedding(self, embedding_dim=1024, vocab_parallel=True):
         def check_embedding(
             padding_idx=None,
             scale_grad_by_freq=False,
@@ -319,10 +322,11 @@ class TestDistributedOps(unittest.TestCase):
                 max_norm=max_norm,
                 norm_type=norm_type,
                 sparse=sparse,
+                vocab_parallel=vocab_parallel,
                 _weight=_weight,
             ).to(torch.device("cuda"))
 
-            equalize_embedding_weights(embedding, dist_embedding)
+            equalize_embedding_weights(embedding, dist_embedding, vocab_parallel=vocab_parallel)
 
             x, x_slice = self.create_indices_with_global_shape(
                 input_shape, low=0, high=(num_embeddings - 1)
@@ -343,13 +347,23 @@ class TestDistributedOps(unittest.TestCase):
             y_dist = torch.dot(torch.flatten(dist_output), weights_dist)
             y.backward()
             y_dist.backward()
-            slice_size = get_local_channels(embedding_dim)
-            start = get_start_pos_for_slicing(embedding_dim)
-            slice_weight = embedding.weight.narrow(-1, start, slice_size).contiguous()
-            if not sparse:
-                weight_grad_slice = embedding.weight.grad.narrow(-1, start, slice_size)
+
+            if vocab_parallel:
+                slice_dim = 0
+                slice_size = get_local_channels(num_embeddings)
+                start = get_start_pos_for_slicing(num_embeddings)
             else:
-                weight_grad_slice = embedding.weight.grad.to_dense().narrow(-1, start, slice_size)
+                slice_dim = -1
+                slice_size = get_local_channels(embedding_dim)
+                start = get_start_pos_for_slicing(embedding_dim)
+
+            slice_weight = embedding.weight.narrow(slice_dim, start, slice_size).contiguous()
+            if not sparse:
+                weight_grad_slice = embedding.weight.grad.narrow(slice_dim, start, slice_size)
+            else:
+                weight_grad_slice = embedding.weight.grad.to_dense().narrow(
+                    slice_dim, start, slice_size
+                )
 
             if not sparse:
                 self.assertTrue(

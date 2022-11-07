@@ -86,6 +86,8 @@ class TransformerConfig(object):
         causal_mask_size=None,
         add_cross_attention=False,
         rotary_dim=None,
+        rotary_pct=None,
+        rotary_emb_base=10000,
         _precision_test=True,
         **kwargs
     ):
@@ -101,6 +103,8 @@ class TransformerConfig(object):
         self.causal_mask_size = causal_mask_size
         self.add_cross_attention = add_cross_attention
         self.rotary_dim = rotary_dim
+        self.rotary_pct = rotary_pct
+        self.rotary_emb_base = rotary_emb_base
         self._precision_test = _precision_test
 
     def to_dict(self):
@@ -117,6 +121,8 @@ class TransformerConfig(object):
             "causal_mask_size": self.causal_mask_size,
             "add_cross_attention": self.add_cross_attention,
             "rotary_dim": self.rotary_dim,
+            "rotary_pct": self.rotary_pct,
+            "rotary_emb_base": self.rotary_emb_base,
             "_precision_test": self._precision_test,
         }
 
@@ -145,6 +151,8 @@ class TransformerLMHeadConfig(object):
         _scale_qkv_fan_out=True,
         num_token_types=0,
         rotary_dim=None,
+        rotary_pct=None,
+        rotary_emb_base=10000,
     ):
         self.num_layers = num_layers
         self.num_attention_heads = num_attention_heads
@@ -167,6 +175,9 @@ class TransformerLMHeadConfig(object):
         self._scale_qkv_fan_out = _scale_qkv_fan_out
         self.num_token_types = num_token_types
         self.rotary_dim = rotary_dim
+        self.rotary_pct = rotary_pct
+        self.rotary_emb_base = rotary_emb_base
+
 
     def to_dict(self):
         return {
@@ -191,6 +202,8 @@ class TransformerLMHeadConfig(object):
             "_scale_qkv_fan_out": self._scale_qkv_fan_out,
             "num_token_types": self.num_token_types,
             "rotary_dim": self.rotary_dim,
+            "rotary_pct": self.rotary_pct,
+            "rotary_emb_base": self.rotary_emb_base,
         }
 
 
@@ -215,7 +228,7 @@ class TransformerSelfAttention(nn.Module):
         self.use_pre_layernorm = config.pre_layernorm
         self.add_cross_attention = config.add_cross_attention
         self.rotary_dim = config.rotary_dim
-        self.fp16_params = core.cfg.fp16_params
+        self.fp16_params = core.cfg._fp16_param_init
 
         if self.use_pre_layernorm:
             self.PreLayerNorm = LayerNorm(config.hidden_size, eps=config.layernorm_epsilon)
@@ -415,7 +428,7 @@ class TransformerLMHead(nn.Module):
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
         self.transformer = Transformer(config)
         self.ce_loss = nn.CrossEntropyLoss()
-        self.fp16_params = core.cfg.fp16_params
+        self.fp16_params = core.cfg._fp16_param_init
         if config.add_lm_head:
             self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
             self.lm_head.weight = self.word_embedding.weight

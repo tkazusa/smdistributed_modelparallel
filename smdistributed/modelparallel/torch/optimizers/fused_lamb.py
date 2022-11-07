@@ -1,10 +1,11 @@
 # Third Party
 import torch
-from apex.multi_tensor_apply import multi_tensor_applier
-from apex.optimizers import FusedLAMB as ApexFusedLAMB
+from smdistributed.modelparallel.torch.apex.multi_tensor_apply import multi_tensor_applier
+from smdistributed.modelparallel.torch.apex.optimizers import FusedLAMB as ApexFusedLAMB
 
 # First Party
 from smdistributed.modelparallel.backend.collectives import CommGroup
+from smdistributed.modelparallel.torch.exceptions import FusedLAMBError
 from smdistributed.modelparallel.torch.optimizers.utils import get_device
 from smdistributed.modelparallel.torch.state_mod import state
 
@@ -27,7 +28,7 @@ class FusedLAMB(ApexFusedLAMB):
                 elif p.dtype == torch.float16:
                     g_all_16.append(p.grad.data)
                 else:
-                    raise RuntimeError("FusedLAMB only support fp16 and fp32.")
+                    raise FusedLAMBError("FusedLAMB only support fp16 and fp32.")
 
         device = get_device(self.param_groups)
         g_norm_32, g_norm_16 = torch.zeros(1, device=device), torch.zeros(1, device=device)
@@ -73,7 +74,7 @@ class FusedLAMB(ApexFusedLAMB):
                 if p.requires_grad is False or p.grad is None:
                     continue
                 if p.grad.data.is_sparse:
-                    raise RuntimeError(
+                    raise FusedLAMBError(
                         "FusedLAMB does not support sparse gradients, please consider SparseAdam instead"
                     )
 
@@ -96,7 +97,7 @@ class FusedLAMB(ApexFusedLAMB):
                     m_32.append(param_state["exp_avg"])
                     v_32.append(param_state["exp_avg_sq"])
                 else:
-                    raise RuntimeError("FusedLAMB only support fp16 and fp32.")
+                    raise FusedLAMBError("FusedLAMB only support fp16 and fp32.")
 
             if len(g_16) > 0:
                 multi_tensor_applier(

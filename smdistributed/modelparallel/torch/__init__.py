@@ -1,5 +1,6 @@
 # Standard Library
 import functools
+import os
 from typing import Dict, Union
 
 # Third Party
@@ -9,13 +10,18 @@ import torch
 from smdistributed.modelparallel.backend import init_internal
 from smdistributed.modelparallel.backend.logger import get_logger
 from smdistributed.modelparallel.torch import amp, nn, smplib
-from smdistributed.modelparallel.torch.checkpoint import load, save
+from smdistributed.modelparallel.torch.checkpoint import (
+    load,
+    resume_from_checkpoint,
+    save,
+    save_checkpoint,
+)
 from smdistributed.modelparallel.torch.comm import *
 from smdistributed.modelparallel.torch.core import *
-from smdistributed.modelparallel.torch.model import DistributedModel
+from smdistributed.modelparallel.torch.model import DistributedModel, model_creation
 from smdistributed.modelparallel.torch.optimizers.optimizer import DistributedOptimizer
-from smdistributed.modelparallel.torch.patches.checkpoint import checkpoint
 from smdistributed.modelparallel.torch.parameter import delay_param_initialization
+from smdistributed.modelparallel.torch.patches.checkpoint import checkpoint
 from smdistributed.modelparallel.torch.state_mod import state
 from smdistributed.modelparallel.torch.step import step
 
@@ -73,6 +79,12 @@ __all__ = [
 ]
 
 
+# Make sure we are inside SM and the mpi job has started already
+# To avoid init for the case that there is any import in the training toolkit etc that happens before training
+# Assumes that OpenMPI is used as the underlying MPI implementation
+sagemaker_env = "SM_HP_MP_PARAMETERS" in os.environ and "OMPI_COMM_WORLD_RANK" in os.environ
+
+
 def init(config: Dict[str, Union[str, int, bool]] = None):
     """
     Initialize SMP.
@@ -98,8 +110,13 @@ def init(config: Dict[str, Union[str, int, bool]] = None):
                 The tolerance for load imbalance. Larger values indicate higher tolerance. Too low tolerance might lead to
                 increased communication.
     """
+    if state.initialized and sagemaker_env:
+        logger.warning(
+            "SageMaker model parallelism is initialized already. Ignoring the smp.init() call."
+        )
+        return
+
     from smdistributed.modelparallel.backend.config import ModelParallelConfig
-    import os
 
     if config is None:
         config = {}
@@ -118,6 +135,7 @@ def init(config: Dict[str, Union[str, int, bool]] = None):
     state.patch_manager.save_original_methods()
     # this needs to be patched before distribute_model as we need patch during init
     state.patch_manager.patch_constructor()
+    torch.cuda.set_device(local_rank())
 
 
 def is_initialized():
@@ -142,3 +160,17 @@ set_tensor_parallelism = functools.partial(state.module_manager.set_tensor_paral
 tp_register = functools.partial(state.tp_registry.register)
 tp_register_with_module = functools.partial(state.tp_registry.register_with_module)
 delay_param_initialization = functools.partial(delay_param_initialization)
+model_creation = functools.partial(model_creation)
+
+
+""" If running through SageMaker, init() is hidden and automatically called with import
+    by default.
+    Manual call of smp.init() is still an option. To enable this option, user needs to
+    explicitly set an environment variable SMP_MANUAL_INIT through Python when using
+    SageMaker estimator API.
+"""
+if sagemaker_env:  # running through SageMaker
+    manual_init = os.environ.get("SMP_MANUAL_INIT", default="0")
+    manual_init = int(manual_init)
+    if manual_init == 0:
+        init()

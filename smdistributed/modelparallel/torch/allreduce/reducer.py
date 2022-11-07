@@ -8,6 +8,7 @@ from torch.nn import Parameter
 
 # First Party
 from smdistributed.modelparallel.backend.logger import get_logger
+from smdistributed.modelparallel.torch.exceptions import SMPUnsupportedError
 
 logger = get_logger()
 
@@ -79,11 +80,11 @@ class GradReducer:
 
     @abstractmethod
     def _synchronize_internal(self):
-        raise NotImplementedError
+        raise SMPUnsupportedError
 
     @abstractmethod
     def _hook_internal(self, name, param, grads):
-        raise NotImplementedError
+        raise SMPUnsupportedError
 
     def _make_grad_hook(self, name, param):
         def hook(*grads):

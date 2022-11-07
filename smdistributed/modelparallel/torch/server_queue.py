@@ -16,6 +16,11 @@ from smdistributed.modelparallel.backend.collectives import (
 from smdistributed.modelparallel.backend.logger import get_logger
 from smdistributed.modelparallel.torch import smplib
 from smdistributed.modelparallel.torch.core import dp_rank, pp_rank, rank
+from smdistributed.modelparallel.torch.exceptions import (
+    SMPRuntimeError,
+    SMPUnsupportedError,
+    UnsupportedMessageError,
+)
 from smdistributed.modelparallel.torch.messages import (
     DummyBackwardResult,
     ExecutionResult,
@@ -102,8 +107,12 @@ class IncomingMessageTask(ServerTask):
     """ A task that is defined by an underlying message. Can be an execution request,
         result, or control messaging. """
 
-    def __init__(self, message):
+    def __init__(self, message, stubbed_message=None):
+        # stubbed_message argument is only used in static mode, used to reconstruct the
+        # task from the incoming tensors
+
         self.message = message
+        self.stubbed_message = stubbed_message
 
         message_type = message.__class__.__name__
         is_response = isinstance(message, (ExecutionResult, ResumeBackward))
@@ -112,6 +121,8 @@ class IncomingMessageTask(ServerTask):
 
         if is_tracing_request or is_tracing_result:
             message_meta = None
+        elif stubbed_message is not None:
+            message_meta = stubbed_message
         elif isinstance(
             message,
             (StepExecutionRequest, ModuleExecutionRequest, SequentialModulesExecutionRequest),
@@ -135,7 +146,7 @@ class IncomingMessageTask(ServerTask):
         elif isinstance(message, ResumeBackward):
             message_meta = copy.copy(message.req)
         else:
-            raise RuntimeError(f"Unsupported message type {type(message)}.")
+            raise UnsupportedMessageError(type(message))
 
         self.task_metadata = TaskMetadata(
             False,
@@ -192,10 +203,10 @@ class ServerQueue:
         self.in_flight_mbs = 0
 
     def has_more_tasks(self):
-        raise NotImplementedError
+        raise SMPUnsupportedError
 
     def get_next_task(self, block=False):
-        raise NotImplementedError
+        raise SMPUnsupportedError
 
     def mark_step_done(self):
         self.in_flight_mbs = 0
@@ -296,15 +307,20 @@ class DeterministicServerQueue(ServerQueue):
         if self.task_artifact != None:
             stubmsg, stubs = self.task_artifact
             self.recorded_task_orders[state.current_step_func()][cur_step].append(
-                IncomingMessageTask(stubmsg)
+                IncomingMessageTask(stubmsg, stubmsg).task_metadata
             )
             self.recorded_task_idx_to_stubs[state.current_step_func()][cur_step].append(stubs)
             self.task_artifact = None
         else:
-            assert not isinstance(next_task, IncomingMessageTask) or not isinstance(
+            if isinstance(next_task, IncomingMessageTask) and isinstance(
                 next_task.message, StubbedMessage
-            ), f"StubbedMessage {next_task.message} is not recorded in static mode!"
-            self.recorded_task_orders[state.current_step_func()][cur_step].append(next_task)
+            ):
+                raise SMPRuntimeError(
+                    f"StubbedMessage {next_task.message} is not recorded in static mode!"
+                )
+            self.recorded_task_orders[state.current_step_func()][cur_step].append(
+                next_task.task_metadata
+            )
             self.recorded_task_idx_to_stubs[state.current_step_func()][cur_step].append(None)
 
     def _record_task(self, next_task):
@@ -334,9 +350,10 @@ class DeterministicServerQueue(ServerQueue):
         # if fast mode is enabled, ignore the first step, since the communication pattern
         # will not be the same as the other steps
         if state.cfg.fast_mode:
-            assert (
-                len(step_times) > 1
-            ), "When fast mode is enabled, record_step must be larger than 0"
+            if len(step_times) <= 1:
+                raise SMPRuntimeError(
+                    "When fast mode is enabled, record_step must be larger than 1"
+                )
             step_times = step_times[1:]
             return 1 + step_times.index(min(step_times))
 
@@ -390,18 +407,8 @@ class DeterministicServerQueue(ServerQueue):
         else:
             self.current_task += 1
             if state.cfg.static_mode:
-                # directly return the task
-                current_task = self.task_order[state.current_step_func()][self.current_task]
-                if isinstance(current_task, IncomingMessageTask) and isinstance(
-                    current_task.message, StubbedMessage
-                ):
-                    with state.serialization_manager.catch_and_raise_for_large_object(current_task):
-                        current_task = copy.deepcopy(current_task)
-                    destub_msg = self.comm.reconstruct_destubmessage(
-                        current_task.message,
-                        self.task_idx_to_stubs[state.current_step_func()][self.current_task],
-                    )
-                    current_task.message = destub_msg
+                current_task_meta = self.task_order[state.current_step_func()][self.current_task]
+                current_task = self._create_task_from_meta(current_task_meta)
             else:
                 task_metadata = self.task_order[state.current_step_func()][self.current_task]
                 current_task = self._get_next_task_with_meta(task_metadata)
@@ -409,17 +416,35 @@ class DeterministicServerQueue(ServerQueue):
             self.maybe_load_activations()
             return current_task
 
+    def _create_task_from_meta(self, task_metadata):
+        """ Used only in static mode """
+
+        if task_metadata.is_incoming_message:
+            with state.serialization_manager.catch_and_raise_for_large_object(task_metadata):
+                task_metadata = copy.deepcopy(task_metadata)
+
+            if isinstance(task_metadata.message_meta, StubbedMessage):
+                destub_msg = self.comm.reconstruct_destubmessage(
+                    task_metadata.message_meta,
+                    self.task_idx_to_stubs[state.current_step_func()][self.current_task],
+                )
+                return IncomingMessageTask(destub_msg)
+            return IncomingMessageTask(task_metadata.message_meta)
+
+        return NextMicrobatchTask(task_metadata.mb)
+
     def register_incoming_tensor_metadata(self):
         """Passing the cached tensor reception requests to the listener
            Each (src, link_id) will contain a queue of the tensor reception requests"""
         incoming_tensors_metadata = []
         incoming_tensors_metadata_ = []
         recorded_src_ids = set()
-        for idx, task in enumerate(self.task_order[state.current_step_func()]):
-            if isinstance(task, IncomingMessageTask) and isinstance(task.message, StubbedMessage):
-                assert (
-                    self.task_idx_to_stubs[state.current_step_func()][idx] != None
-                ), f"StubbedMessage {task.message} and its stubs are not recorded in static mode!"
+        for idx, task_meta in enumerate(self.task_order[state.current_step_func()]):
+            if task_meta.is_incoming_message and isinstance(task_meta.message_meta, StubbedMessage):
+                if self.task_idx_to_stubs[state.current_step_func()][idx] == None:
+                    raise SMPRuntimeError(
+                        f"StubbedMessage {task_meta.message_meta} and its stubs are not recorded in static mode!"
+                    )
                 stubs = self.task_idx_to_stubs[state.current_step_func()][idx]
                 current_task_tensor_meta = []
                 current_task_tensor_meta_ = []
@@ -436,9 +461,10 @@ class DeterministicServerQueue(ServerQueue):
                     # which covers the two cases in the condition below.
                     if not stub.is_dummy and not stub.src == rank():
                         src_id = (stub.src, stub.link_id)
-                        assert (
-                            src_id not in recorded_src_ids
-                        ), f"Duplicated src_id pair {src_id} is not allowed!"
+                        if src_id in recorded_src_ids:
+                            raise SMPRuntimeError(
+                                f"Duplicated src_id pair {src_id} is not allowed!"
+                            )
                         recorded_src_ids.add(src_id)
                         tensor_meta = smplib.TorchTensorMeta(
                             dims=len(stub.shape),
@@ -464,12 +490,12 @@ class DeterministicServerQueue(ServerQueue):
         )
 
     def maybe_load_activations(self):
-        """ Preemptively load the activations for the next activation_loading_horizon tasks """
+        """ Preemptively load the activations for the next task_level_activation_loading_horizon tasks """
 
         if state.cfg.offload_activations and self.has_recorded_bwd_fwd_tasks:
             step_fn = state.current_step_func()
 
-            for offset in range(state.cfg.activation_loading_horizon):
+            for offset in range(state.cfg.task_level_activation_loading_horizon):
                 task_metadata = self.task_order[step_fn][self.current_task + offset]
                 if self._task_needs_activations(task_metadata, self.current_task + offset):
                     if self._is_ready_for_loading(offset):
@@ -559,7 +585,8 @@ class DeterministicServerQueue(ServerQueue):
         # record_step steps
         if cur_step == self.record_step:
             if pp_rank() == 0 and dp_rank() == 0:
-                assert rank() == 0, "pp_rank 0 and dp_rank 0 must be rank 0"
+                if rank() != 0:
+                    raise SMPRuntimeError("pp_rank 0 and dp_rank 0 must be rank 0")
                 self.best_step = self.find_best_step()
                 state.comm.broadcast(self.best_step, CommGroup.WORLD)
             else:

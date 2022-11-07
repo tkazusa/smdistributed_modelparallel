@@ -12,6 +12,7 @@ from torch import set_grad_enabled
 # First Party
 from smdistributed.modelparallel.backend.logger import get_logger
 from smdistributed.modelparallel.torch.core import local_rank
+from smdistributed.modelparallel.torch.exceptions import SMPRuntimeError, SMPUnsupportedError
 from smdistributed.modelparallel.torch.messages import (
     BackwardExecutionResult,
     DummyBackwardResult,
@@ -27,6 +28,7 @@ from smdistributed.modelparallel.torch.messages import (
     WaitForBackwardDoneRequest,
     WaitForBackwardRequest,
 )
+from smdistributed.modelparallel.torch.parameter import use_torchdistx
 from smdistributed.modelparallel.torch.patches.checkpoint import CheckpointConfig
 from smdistributed.modelparallel.torch.patches.tracing import TracingEnd
 from smdistributed.modelparallel.torch.pipeline import MbStatus
@@ -137,7 +139,7 @@ class WorkerHolder:
             state.exec_server.process_result(r)
             self.reset()
         else:
-            raise NotImplementedError(f"{req}")
+            raise SMPUnsupportedError(f"{req}")
 
     def execute(self, req: ExecutionRequest):
         """
@@ -256,6 +258,8 @@ class WorkerHolder:
             state.cfg.auto_partition
             and not state.cfg.skip_tracing
             and state.model.size() <= SKIP_TRACING_MODEL_SIZE_THRESHOLD_BYTES
+            and not (state.cfg.delayed_parameter_initialization and use_torchdistx)
+            and not state.cfg.zero2d_enabled()
         ):
             for trial in range(5):
                 # some runs to warmup, times at the beginning may not be representative of actual time
@@ -325,7 +329,8 @@ class WorkerHolder:
         if state.cfg.fast_mode and state.current_minibatch() == 0 and state.microbatch == 0:
             # mark module info
             step_func = state.current_step_func()
-            assert step_func is not None
+            if step_func == None:
+                raise SMPRuntimeError("step_func should not be None")
 
             with flattened((req.args, req.kwargs)) as flat_args:
                 # if requester is already the rank that generated the tensor, exclude it from
@@ -371,7 +376,7 @@ class WorkerHolder:
                 )
 
         else:
-            raise NotImplementedError
+            raise SMPUnsupportedError
         self.comm_queue.put(ForwardExecutionResult(req, outputs))
 
     def _bwd_aggregated_execute(self, req, mod, parent_mod):
@@ -395,17 +400,21 @@ class WorkerHolder:
         # retain graph in memory after backward only if there are parameters in this
         # partition that are expecting more backward calls later
         retain = False
-        for p in state.model.local_parameters():
-            name = state.model.get_param_name(p)
-            expected_count = state.model.grad_counter.get_param_grad_count(state.microbatch, name)
-            seen_count = state.model.grad_counter.get_seen_grad_count(state.microbatch, name)
-            if expected_count - seen_count > 1:
-                retain = True
-                break
+        if not state.cfg.zero2d_enabled():
+            for p in state.model.local_parameters():
+                name = state.model.get_param_name(p)
+                expected_count = state.model.grad_counter.get_param_grad_count(
+                    state.microbatch, name
+                )
+                seen_count = state.model.grad_counter.get_seen_grad_count(state.microbatch, name)
+                if expected_count - seen_count > 1:
+                    retain = True
+                    break
 
-        state.model.grad_counter.set_microbatch(state.microbatch)
+            state.model.grad_counter.set_microbatch(state.microbatch)
         torch.autograd.backward(all_outputs, all_grads, retain_graph=retain)
-        state.model.grad_counter.set_microbatch(-1)
+        if not state.cfg.zero2d_enabled():
+            state.model.grad_counter.set_microbatch(-1)
         self.comm_queue.put(BackwardExecutionResult(req))
 
     def thread_execute_backward(self, req: ModuleExecutionRequest):
@@ -437,7 +446,8 @@ class WorkerHolder:
                 req.mb, mod, parent_mod, 1, real=True, sequential=sequential
             )
         else:
-            assert parent_mod == sender_mod
+            if parent_mod != sender_mod:
+                raise SMPRuntimeError("parent_mod should be equal to sender_mod")
             sender_is_parent = True
             state.module_manager.load_smpinput_bwd_count(req.mb, req.position, mod, parent_mod)
 
@@ -449,7 +459,8 @@ class WorkerHolder:
         required_outputs = []
         required_grads = []
         if isinstance(outputs, tuple) or isinstance(outputs, list):
-            assert len(outputs) == len(output_grads), "output grads and outputs length should match"
+            if len(outputs) != len(output_grads):
+                raise SMPRuntimeError("output grads and outputs length should match")
             for output, output_grad in zip(outputs, output_grads):
                 if output.requires_grad:
                     required_outputs.append(output)
@@ -465,7 +476,8 @@ class WorkerHolder:
             and state.microbatch == 0
         ):
             step_func = state.current_step_func()
-            assert step_func is not None
+            if step_func == None:
+                raise SMPRuntimeError("step_func should not be None")
             step_func.update_direct_bwd_consumers(required_grads, mod)
 
         state.module_manager.enqueue_bwd_tensors(

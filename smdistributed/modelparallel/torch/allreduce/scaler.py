@@ -1,5 +1,6 @@
 # First Party
 from smdistributed.modelparallel.torch.allreduce.reducer import GradReducer
+from smdistributed.modelparallel.torch.exceptions import SMPUnsupportedError
 
 
 class GradScaler(GradReducer):
@@ -13,7 +14,8 @@ class GradScaler(GradReducer):
         scaled_batch,
         tp_size,
     ):
-        assert overlapping_allreduce is False
+        if overlapping_allreduce:
+            raise SMPUnsupportedError
         super(GradScaler, self).__init__(
             named_parameters=named_parameters,
             grad_counter=grad_counter,
